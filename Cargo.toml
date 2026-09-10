@@ -1,0 +1,23 @@
+[package]
+name = "rtx-unlock"
+version = "0.2.0"
+edition = "2021"
+description = "DLSS Frame Generation unlock and DLSS 5 neural rendering for RTX 20 and 30 series, in one executable"
+
+[dependencies]
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "persistence"] }
+goblin = { version = "0.10", default-features = false, features = ["pe64", "pe32", "std"] }
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+zip = { version = "4", default-features = false, features = ["deflate"] }
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rfd = "0.15"
+winreg = "0.55"
+windows = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[profile.release]
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
