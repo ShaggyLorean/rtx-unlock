@@ -29,6 +29,17 @@ pub struct GameInfo {
     pub imports: Vec<String>,
     pub present: Vec<(String, String)>,
     pub dlssg: bool,
+    pub anticheat: Option<&'static str>,
+}
+
+pub fn detect_anticheat(root: &Path) -> Option<&'static str> {
+    if root.join("EasyAntiCheat").is_dir() || root.join("start_protected_game.exe").exists() {
+        return Some("Easy Anti-Cheat");
+    }
+    if root.join("BattlEye").is_dir() {
+        return Some("BattlEye");
+    }
+    None
 }
 
 pub const PROXY_NAMES: [&str; 8] = [
@@ -74,24 +85,36 @@ fn lower_name(p: &Path) -> String {
 }
 
 pub fn is_helper_exe(lower_name: &str) -> bool {
-    const HELPERS: [&str; 12] = [
+    const HELPERS: [&str; 14] = [
         "crash", "report", "installer", "setup", "launcher", "unins", "redist", "vc_redist",
-        "dxsetup", "easyanticheat", "eac", "helper",
+        "dxsetup", "easyanticheat", "eac", "helper", "prereq", "start_protected_game",
     ];
     HELPERS.iter().any(|h| lower_name.contains(h))
 }
 
 pub fn find_exe(root: &Path) -> Result<PathBuf, String> {
-    let mut found = None;
+    let mut shipping = None;
+    let mut in_binaries: Vec<(u64, PathBuf)> = Vec::new();
     walk(root, 4, &mut |p| {
-        if lower_name(p).ends_with("-win64-shipping.exe") {
-            found = Some(p.to_path_buf());
-            true
-        } else {
-            false
+        let n = lower_name(p);
+        if !n.ends_with(".exe") || is_helper_exe(&n) {
+            return false;
         }
+        if n.ends_with("-win64-shipping.exe") {
+            shipping = Some(p.to_path_buf());
+            return true;
+        }
+        let dir = p.to_string_lossy().to_ascii_lowercase();
+        if dir.contains("\\binaries\\win64\\") {
+            let size = fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            in_binaries.push((size, p.to_path_buf()));
+        }
+        false
     });
-    if let Some(p) = found {
+    if let Some(p) = shipping {
+        return Ok(p);
+    }
+    if let Some((_, p)) = in_binaries.into_iter().max_by_key(|(s, _)| *s) {
         return Ok(p);
     }
     let mut best: Option<(u64, PathBuf)> = None;
@@ -183,6 +206,7 @@ pub fn analyze(root: &Path) -> Result<GameInfo, String> {
     let engine = detect_engine(root, &exe);
     let present = present_proxies(&proxy_dir);
     let dlssg = dlssg_present(root);
+    let anticheat = detect_anticheat(root);
     Ok(GameInfo {
         root: root.to_path_buf(),
         exe,
@@ -191,6 +215,7 @@ pub fn analyze(root: &Path) -> Result<GameInfo, String> {
         imports,
         present,
         dlssg,
+        anticheat,
     })
 }
 
@@ -219,6 +244,21 @@ mod tests {
     }
 
     #[test]
+    fn binaries_exe_beats_root_helpers() {
+        let tmp = std::env::temp_dir().join(format!("rtxu-exe-{}", std::process::id()));
+        let bin = tmp.join("Ravage").join("Binaries").join("Win64");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(tmp.join("EasyAntiCheat")).unwrap();
+        fs::write(tmp.join("PrereqsBundle.exe"), vec![0u8; 4000]).unwrap();
+        fs::write(tmp.join("start_protected_game.exe"), vec![0u8; 3000]).unwrap();
+        fs::write(bin.join("CrashReportClient.exe"), vec![0u8; 5000]).unwrap();
+        fs::write(bin.join("Halloween.exe"), vec![0u8; 2000]).unwrap();
+        assert!(find_exe(&tmp).unwrap().ends_with("Halloween.exe"));
+        assert_eq!(detect_anticheat(&tmp), Some("Easy Anti-Cheat"));
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
     fn helper_exes_are_skipped() {
         assert!(is_helper_exe("crashreport.exe"));
         assert!(is_helper_exe("installermessage.exe"));
@@ -233,6 +273,7 @@ mod tests {
         eprintln!("exe: {}", i.exe.display());
         eprintln!("engine: {:?}", i.engine);
         eprintln!("dlssg: {}", i.dlssg);
+        eprintln!("anticheat: {:?}", i.anticheat);
         eprintln!("imports: {}", i.imports.join(", "));
         eprintln!("present: {:?}", i.present);
     }

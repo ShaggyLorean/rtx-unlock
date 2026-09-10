@@ -562,6 +562,12 @@ impl eframe::App for App {
                         .filter(|p| i.imports.iter().any(|x| x == p))
                         .collect();
                     ui.label(format!("proxy names the exe loads: {}", imported.join(", ")));
+                    if let Some(ac) = i.anticheat {
+                        ui.colored_label(
+                            egui::Color32::LIGHT_RED,
+                            format!("{ac} is present. It can refuse to start the game with a proxy DLL in place, and online play with one can get the account banned."),
+                        );
+                    }
                     if i.present.is_empty() {
                         ui.label("proxies already in the folder: none");
                     } else {
