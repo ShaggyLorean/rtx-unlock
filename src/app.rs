@@ -74,12 +74,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let mut style = (*cc.egui_ctx.style()).clone();
-        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        style.spacing.button_padding = egui::vec2(14.0, 6.0);
-        style.spacing.indent = 24.0;
-        cc.egui_ctx.set_style(style);
+    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let (games, steam_error) = match steam::scan() {
             Ok(g) => (g, None),
             Err(e) => (Vec::new(), Some(e)),
@@ -468,8 +463,6 @@ impl eframe::App for App {
         }
 
         let mut pick: Option<PathBuf> = None;
-        let margin = egui::Margin::same(14);
-
         let mut do_update = false;
         let banner = match &self.update {
             UpdateState::Available(r) => Some((format!("Version {} is available.", r.version), true)),
@@ -478,9 +471,7 @@ impl eframe::App for App {
             _ => None,
         };
         if let Some((text, offer)) = banner {
-            egui::TopBottomPanel::top("update")
-                .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(14, 8)))
-                .show(ctx, |ui| {
+            egui::TopBottomPanel::top("update").show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(text);
                         if offer && ui.add_enabled(!self.busy, egui::Button::new("Update now")).clicked() {
@@ -490,11 +481,8 @@ impl eframe::App for App {
                 });
         }
 
-        egui::SidePanel::left("games")
-            .min_width(280.0)
-            .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(margin))
-            .show(ctx, |ui| {
-            ui.add_space(2.0);
+        egui::SidePanel::left("games").min_width(280.0).show(ctx, |ui| {
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label("Search:");
                 ui.text_edit_singleline(&mut self.filter);
@@ -525,11 +513,7 @@ impl eframe::App for App {
             });
         });
 
-        egui::TopBottomPanel::bottom("log")
-            .min_height(180.0)
-            .resizable(true)
-            .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(margin))
-            .show(ctx, |ui| {
+        egui::TopBottomPanel::bottom("log").min_height(200.0).resizable(true).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Log");
                 if ui.small_button("clear").clicked() {
@@ -545,14 +529,8 @@ impl eframe::App for App {
 
         let mut action: Option<Action> = None;
         let mut nr_save = false;
-        egui::CentralPanel::default()
-            .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(margin))
-            .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("rtx-unlock");
-                ui.add_space(4.0);
-                ui.colored_label(egui::Color32::GRAY, env!("CARGO_PKG_VERSION"));
-            });
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("rtx-unlock");
             match &self.gpu {
                 Ok(g) => {
                     ui.label(format!("GPU: {} | driver {} | {}", g.name, g.driver, g.class.label()));
