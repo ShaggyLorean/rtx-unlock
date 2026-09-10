@@ -3,13 +3,11 @@ use std::process::Command;
 
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// Start a child process without flashing a console window.
 pub fn no_window(cmd: &mut Command) -> &mut Command {
     use std::os::windows::process::CommandExt;
     cmd.creation_flags(CREATE_NO_WINDOW)
 }
 
-/// %LOCALAPPDATA%\rtx-unlock
 pub fn data_dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
@@ -17,7 +15,6 @@ pub fn data_dir() -> PathBuf {
     base.join("rtx-unlock")
 }
 
-/// OriginalFilename from the PE version resource (UE4SS: proxy.rc, ReShade: ReShade64.dll).
 pub fn original_filename(path: &Path) -> Option<String> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;

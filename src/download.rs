@@ -35,7 +35,6 @@ pub fn fetch_text(url: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&b).into_owned())
 }
 
-/// Download, verify SHA-256, keep under `cache/<sha>`. A cached copy with a matching hash is reused.
 pub fn fetch(url: &str, sha256: &str, log: &dyn Fn(String)) -> Result<PathBuf, String> {
     let sha256 = sha256.to_ascii_lowercase();
     let dir = cache_dir();
@@ -59,8 +58,6 @@ pub fn fetch(url: &str, sha256: &str, log: &dyn Fn(String)) -> Result<PathBuf, S
     Ok(dst)
 }
 
-/// A source whose hash is not known ahead of time (nightly builds). Downloads, logs the hash,
-/// stores under `cache/<sha>`.
 pub fn fetch_unpinned(url: &str, log: &dyn Fn(String)) -> Result<PathBuf, String> {
     let dir = cache_dir();
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create cache folder: {e}"))?;

@@ -4,11 +4,8 @@ use crate::winutil::no_window;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuClass {
-    /// Turing: RTX 20xx, GTX 16xx
     Sm75,
-    /// Ampere: RTX 30xx (and the RTX 2050, which is GA107)
     Sm86,
-    /// RTX 40/50: DLSS Frame Generation already runs, no unlock needed
     NativeFg,
     Unsupported,
 }
