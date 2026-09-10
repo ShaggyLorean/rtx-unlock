@@ -1,6 +1,6 @@
 [package]
 name = "rtx-unlock"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "DLSS Frame Generation unlock and DLSS 5 neural rendering for RTX 20 and 30 series, in one executable"
 

@@ -4,7 +4,7 @@
 
 <p align="center"><a href="https://github.com/ShaggyLorean/rtx-unlock/releases/latest">Download the latest release</a></p>
 
-<br>
+<p align="center"><img src="assets/screenshot.png" width="860" alt="rtx-unlock with Bodycam selected: both components installed, each with its own Remove checkbox"></p>
 
 ## What it does
 
@@ -29,6 +29,12 @@ Both are removable. Every file the tool writes is recorded in a manifest next to
    - Frame Generation: enable "NVIDIA DLSS Frame Generation" in the game's settings. Start with 2X.
    - DLSS 5: press Home to open ReShade, then enable neural rendering on the DLSS 5 tab. On RTX 20 and 30 the model runs in FP16 and costs roughly half your frame rate at full model resolution; lower the model resolution.
 5. Check reports what is installed and what the logs say. Removing deletes only the files listed in the tool's manifest, so a hand-made install is left alone and named as such.
+
+A folder path on the command line selects that game at startup: `rtx-unlock.exe "D:\Games\Bodycam"`.
+
+## Updates
+
+On startup the app compares itself with the latest GitHub release. When a newer one exists, a bar at the top offers Update now. The new executable is checked against the release's SHA256SUMS.txt, swapped in place of the running one, and the app restarts with the same game selected.
 
 ## DLSS 5 settings
 

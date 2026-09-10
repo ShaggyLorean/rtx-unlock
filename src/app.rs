@@ -10,11 +10,25 @@ use crate::game::{self, GameInfo};
 use crate::gpu::{self, Gpu, GpuClass};
 use crate::nr::{self, LogFacts, NrSettings};
 use crate::steam::{self, SteamGame};
+use crate::update::{self, Release};
 
 enum Msg {
     Log(String),
     Analyzed(Box<Result<GameInfo, String>>),
     Done,
+}
+
+enum UpdateMsg {
+    Checked(Result<Option<Release>, String>),
+    Failed(String),
+}
+
+enum UpdateState {
+    Unknown,
+    UpToDate,
+    Available(Release),
+    Working,
+    Failed(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -55,10 +69,17 @@ pub struct App {
     nr: Option<NrSettings>,
     nr_facts: Option<LogFacts>,
     nr_dirty: bool,
+    update: UpdateState,
+    urx: Option<Receiver<UpdateMsg>>,
 }
 
 impl App {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let mut style = (*cc.egui_ctx.style()).clone();
+        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        style.spacing.button_padding = egui::vec2(14.0, 6.0);
+        style.spacing.indent = 24.0;
+        cc.egui_ctx.set_style(style);
         let (games, steam_error) = match steam::scan() {
             Ok(g) => (g, None),
             Err(e) => (Vec::new(), Some(e)),
@@ -83,8 +104,12 @@ impl App {
             nr: None,
             nr_facts: None,
             nr_dirty: false,
+            update: UpdateState::Unknown,
+            urx: None,
         };
-        app.push(format!("rtx-unlock {}", env!("CARGO_PKG_VERSION")));
+        update::cleanup_old();
+        app.push(format!("rtx-unlock {}", update::current_version()));
+        app.start_update_check();
         match &app.gpu {
             Ok(g) => app.push(format!("GPU: {} | driver {} | {}", g.name, g.driver, g.class.label())),
             Err(e) => app.push(format!("GPU: {e}")),
@@ -99,11 +124,72 @@ impl App {
         } else {
             app.push("DLSS 5 Autopilot: not present, downloaded on the first DLSS 5 install".into());
         }
+        if let Some(dir) = std::env::args().nth(1) {
+            let p = PathBuf::from(dir);
+            if p.is_dir() {
+                app.select(p);
+            }
+        }
         app
     }
 
     fn push(&mut self, s: String) {
         self.log.push(s);
+    }
+
+    fn start_update_check(&mut self) {
+        let (tx, rx) = channel();
+        self.urx = Some(rx);
+        thread::spawn(move || {
+            let _ = tx.send(UpdateMsg::Checked(update::check()));
+        });
+    }
+
+    fn start_update(&mut self) {
+        let UpdateState::Available(rel) = &self.update else { return };
+        let rel = rel.clone();
+        self.update = UpdateState::Working;
+        let (tx, rx) = channel();
+        self.urx = Some(rx);
+        let (ltx, lrx) = channel();
+        self.rx = Some(lrx);
+        self.busy = true;
+        thread::spawn(move || {
+            let log = move |s: String| {
+                let _ = ltx.send(Msg::Log(s));
+            };
+            if let Err(e) = update::apply(&rel, &log) {
+                let _ = tx.send(UpdateMsg::Failed(e));
+            }
+        });
+    }
+
+    fn poll_update(&mut self) {
+        let mut msg = None;
+        if let Some(rx) = &self.urx {
+            if let Ok(m) = rx.try_recv() {
+                msg = Some(m);
+            }
+        }
+        let Some(m) = msg else { return };
+        self.urx = None;
+        match m {
+            UpdateMsg::Checked(Ok(Some(rel))) => {
+                self.push(format!("version {} is available", rel.version));
+                self.update = UpdateState::Available(rel);
+            }
+            UpdateMsg::Checked(Ok(None)) => self.update = UpdateState::UpToDate,
+            UpdateMsg::Checked(Err(e)) => {
+                self.push(format!("update check failed: {e}"));
+                self.update = UpdateState::Failed(e);
+            }
+            UpdateMsg::Failed(e) => {
+                self.push(format!("ERROR [update]: {e}"));
+                self.update = UpdateState::Failed(e);
+                self.busy = false;
+                self.rx = None;
+            }
+        }
     }
 
     fn fg_install_allowed(&self) -> Result<(), String> {
@@ -376,14 +462,39 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
+        self.poll_update();
         if self.busy {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
         let mut pick: Option<PathBuf> = None;
+        let margin = egui::Margin::same(14);
 
-        egui::SidePanel::left("games").min_width(280.0).show(ctx, |ui| {
-            ui.add_space(6.0);
+        let mut do_update = false;
+        let banner = match &self.update {
+            UpdateState::Available(r) => Some((format!("Version {} is available.", r.version), true)),
+            UpdateState::Working => Some(("Updating, the app restarts by itself.".to_string(), false)),
+            UpdateState::Failed(e) => Some((format!("Update failed: {e}"), false)),
+            _ => None,
+        };
+        if let Some((text, offer)) = banner {
+            egui::TopBottomPanel::top("update")
+                .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(14, 8)))
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(text);
+                        if offer && ui.add_enabled(!self.busy, egui::Button::new("Update now")).clicked() {
+                            do_update = true;
+                        }
+                    });
+                });
+        }
+
+        egui::SidePanel::left("games")
+            .min_width(280.0)
+            .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(margin))
+            .show(ctx, |ui| {
+            ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label("Search:");
                 ui.text_edit_singleline(&mut self.filter);
@@ -414,7 +525,11 @@ impl eframe::App for App {
             });
         });
 
-        egui::TopBottomPanel::bottom("log").min_height(200.0).resizable(true).show(ctx, |ui| {
+        egui::TopBottomPanel::bottom("log")
+            .min_height(180.0)
+            .resizable(true)
+            .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(margin))
+            .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Log");
                 if ui.small_button("clear").clicked() {
@@ -430,8 +545,14 @@ impl eframe::App for App {
 
         let mut action: Option<Action> = None;
         let mut nr_save = false;
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("rtx-unlock");
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(margin))
+            .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("rtx-unlock");
+                ui.add_space(4.0);
+                ui.colored_label(egui::Color32::GRAY, env!("CARGO_PKG_VERSION"));
+            });
             match &self.gpu {
                 Ok(g) => {
                     ui.label(format!("GPU: {} | driver {} | {}", g.name, g.driver, g.class.label()));
@@ -611,6 +732,9 @@ impl eframe::App for App {
             }
         });
 
+        if do_update {
+            self.start_update();
+        }
         if let Some(d) = pick {
             self.select(d);
         }

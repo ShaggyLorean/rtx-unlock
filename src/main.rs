@@ -9,6 +9,7 @@ mod gpu;
 mod nr;
 mod sources;
 mod steam;
+mod update;
 mod winutil;
 
 fn main() -> eframe::Result {
