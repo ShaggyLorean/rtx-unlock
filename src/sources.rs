@@ -1,5 +1,3 @@
-//! Pinned sources. Updating means changing the commit and hashes here and cutting a release.
-
 pub const SDLI_REPO: &str = "sdli1995/dlssg_for_sm86";
 pub const SDLI_COMMIT: &str = "5f62ff44a9c08f9841fa605e7b7160f79ccd2c40";
 pub const SDLI_VERSION: &str = "0.2.4";
@@ -7,7 +5,6 @@ pub const SDLI_LEGACY_VERSION: &str = "0.1.0";
 
 pub const AUTOPILOT_REPO: &str = "Kizzuwatnaa/DLSS5-Autopilot";
 
-/// REFramework nightly: one monolithic dinput8.dll for every RE Engine game.
 pub const REFRAMEWORK_REPO: &str = "praydog/REFramework-nightly";
 pub const REFRAMEWORK_ASSET: &str = "REFramework.zip";
 
@@ -26,7 +23,6 @@ macro_rules! raw {
     };
 }
 
-/// The DLL to download for a given proxy name. The legacy build only exists as version.dll.
 pub fn fg_source(proxy: &str, legacy: bool) -> Option<Source> {
     let s = match (proxy, legacy) {
         ("version.dll", true) => Source {

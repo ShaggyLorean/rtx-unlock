@@ -18,10 +18,22 @@ enum Msg {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Action {
+enum Op {
+    Keep,
     Install,
     Remove,
-    Status,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Action {
+    Apply { fg: Op, dlss5: Op },
+    Check,
+}
+
+struct Row {
+    op_if_ticked: Op,
+    enabled: bool,
+    reason: Option<String>,
 }
 
 pub struct App {
@@ -31,8 +43,8 @@ pub struct App {
     selected: Option<PathBuf>,
     info: Option<Result<GameInfo, String>>,
     gpu: Result<Gpu, String>,
-    want_fg: bool,
-    want_dlss5: bool,
+    fg_tick: bool,
+    dlss5_tick: bool,
     legacy: bool,
     route: String,
     log: Vec<String>,
@@ -40,7 +52,6 @@ pub struct App {
     rx: Option<Receiver<Msg>>,
     fg_status: Option<FgStatus>,
     dlss5_status: Option<Dlss5State>,
-    /// ReShade.ini [RenoDX.DLSS5], present when DLSS 5 is installed.
     nr: Option<NrSettings>,
     nr_facts: Option<LogFacts>,
     nr_dirty: bool,
@@ -60,8 +71,8 @@ impl App {
             selected: None,
             info: None,
             gpu,
-            want_fg: true,
-            want_dlss5: true,
+            fg_tick: false,
+            dlss5_tick: false,
             legacy: false,
             route: "native".into(),
             log: Vec::new(),
@@ -95,18 +106,41 @@ impl App {
         self.log.push(s);
     }
 
-    fn fg_allowed(&self) -> Result<(), String> {
+    fn fg_install_allowed(&self) -> Result<(), String> {
         let gpu = self.gpu.as_ref().map_err(|e| e.clone())?;
         match gpu.class {
             GpuClass::Sm75 | GpuClass::Sm86 => {}
-            GpuClass::NativeFg => return Err("RTX 40/50: no unlock needed".into()),
+            GpuClass::NativeFg => return Err("RTX 40/50 already run DLSS Frame Generation".into()),
             GpuClass::Unsupported => return Err("unsupported GPU".into()),
         }
         match &self.info {
             Some(Ok(i)) if i.dlssg => Ok(()),
-            Some(Ok(_)) => Err("game ships no DLSS-G DLL".into()),
+            Some(Ok(_)) => Err("the game ships no DLSS-G DLL, nothing to unlock".into()),
             Some(Err(e)) => Err(e.clone()),
             None => Err("no game selected".into()),
+        }
+    }
+
+    fn fg_row(&self) -> Row {
+        match &self.fg_status {
+            Some(FgStatus::Installed(_)) => Row { op_if_ticked: Op::Remove, enabled: true, reason: None },
+            Some(FgStatus::Manual(_)) => Row {
+                op_if_ticked: Op::Keep,
+                enabled: false,
+                reason: Some("installed by hand, remove it by hand".into()),
+            },
+            _ => match self.fg_install_allowed() {
+                Ok(()) => Row { op_if_ticked: Op::Install, enabled: true, reason: None },
+                Err(e) => Row { op_if_ticked: Op::Keep, enabled: false, reason: Some(e) },
+            },
+        }
+    }
+
+    fn dlss5_row(&self) -> Row {
+        if self.dlss5_status.is_some() {
+            Row { op_if_ticked: Op::Remove, enabled: true, reason: None }
+        } else {
+            Row { op_if_ticked: Op::Install, enabled: true, reason: None }
         }
     }
 
@@ -144,6 +178,10 @@ impl App {
             self.nr_facts = nr::read_log(&i.proxy_dir);
             self.nr_dirty = false;
         }
+        let fg = self.fg_row();
+        let d5 = self.dlss5_row();
+        self.fg_tick = fg.enabled && fg.op_if_ticked == Op::Install;
+        self.dlss5_tick = d5.enabled && d5.op_if_ticked == Op::Install;
     }
 
     fn save_nr(&mut self) {
@@ -161,7 +199,6 @@ impl App {
         }
     }
 
-    /// Driver and add-on compatibility, the NR codec, device loss: everything the logs reveal.
     fn log_nr_facts(log: &dyn Fn(String), engine: game::Engine, facts: Option<&LogFacts>, settings: Option<&NrSettings>) {
         if let Some(s) = settings {
             log(format!(
@@ -203,12 +240,8 @@ impl App {
     fn start(&mut self, action: Action) {
         let Some(Ok(info)) = self.info.clone() else { return };
         let gpu = self.gpu.clone();
-        let want_fg = self.want_fg && self.fg_allowed().is_ok();
-        let want_dlss5 = self.want_dlss5;
         let legacy = self.legacy;
         let route = self.route.clone();
-        let fg_installed = matches!(self.fg_status, Some(FgStatus::Installed(_)));
-        let dlss5_installed = self.dlss5_status.is_some();
         let (tx, rx) = channel();
         self.rx = Some(rx);
         self.busy = true;
@@ -225,47 +258,46 @@ impl App {
                 }
             };
             match action {
-                Action::Install => {
+                Action::Apply { fg: fg_op, dlss5: d5_op } => {
                     let mut ok = true;
-                    if want_fg {
-                        match &gpu {
+                    match fg_op {
+                        Op::Install => match &gpu {
                             Ok(g) => ok = step("FG unlock", fg::install(&info, g, legacy, &log)),
                             Err(e) => ok = step("FG unlock", Err(e.clone())),
+                        },
+                        Op::Remove => {
+                            step("FG unlock", fg::remove(&info, &log));
                         }
+                        Op::Keep => {}
                     }
-                    if ok && want_dlss5 {
-                        let r = dlss5::ensure_autopilot(&log)
-                            .and_then(|exe| dlss5::install(&exe, &info.root, &route, &log));
-                        if step("DLSS 5", r) && info.engine == game::Engine::ReEngine {
-                            let pw = nr::RE_ENGINE_PAPER_WHITE.to_string();
-                            match nr::set_if_absent(&info.proxy_dir, "NRPaperWhiteScale", &pw) {
-                                Ok(true) => log(format!(
-                                    "RE Engine: NR paper-white preset to {pw} (scene-linear buffer; 1.0 gives a grey frame)."
-                                )),
-                                Ok(false) => {}
-                                Err(e) => log(format!("cannot write NR paper-white: {e}")),
+                    match d5_op {
+                        Op::Install if ok => {
+                            let r = dlss5::ensure_autopilot(&log)
+                                .and_then(|exe| dlss5::install(&exe, &info.root, &route, &log));
+                            if step("DLSS 5", r) && info.engine == game::Engine::ReEngine {
+                                let pw = nr::RE_ENGINE_PAPER_WHITE.to_string();
+                                match nr::set_if_absent(&info.proxy_dir, "NRPaperWhiteScale", &pw) {
+                                    Ok(true) => log(format!(
+                                        "RE Engine: NR paper-white preset to {pw} (scene-linear buffer; 1.0 gives a grey frame)."
+                                    )),
+                                    Ok(false) => {}
+                                    Err(e) => log(format!("cannot write NR paper-white: {e}")),
+                                }
                             }
                         }
+                        Op::Install => log("DLSS 5 skipped because the FG unlock failed".into()),
+                        Op::Remove => {
+                            let r = dlss5::ensure_autopilot(&log)
+                                .and_then(|exe| dlss5::remove(&exe, &info.root, &log));
+                            step("DLSS 5", r);
+                        }
+                        Op::Keep => {}
                     }
-                    if !want_fg && !want_dlss5 {
-                        log("nothing selected".into());
-                    }
-                }
-                Action::Remove => {
-                    if fg_installed {
-                        step("FG unlock", fg::remove(&info, &log));
-                    } else {
-                        log("FG unlock: nothing installed by this tool".into());
-                    }
-                    if dlss5_installed {
-                        let r = dlss5::ensure_autopilot(&log)
-                            .and_then(|exe| dlss5::remove(&exe, &info.root, &log));
-                        step("DLSS 5", r);
-                    } else {
-                        log("DLSS 5: not installed".into());
+                    if fg_op == Op::Keep && d5_op == Op::Keep {
+                        log("nothing ticked".into());
                     }
                 }
-                Action::Status => {
+                Action::Check => {
                     log(format!("FG unlock: {}", fg::status(&info).label()));
                     match dlss5::status(&info.proxy_dir) {
                         Some(s) => {
@@ -318,6 +350,27 @@ impl App {
             self.refresh_status();
         }
     }
+
+    fn component_row(ui: &mut egui::Ui, title: &str, status: &str, row: &Row, tick: &mut bool) -> bool {
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.strong(title);
+            ui.label(status);
+        });
+        ui.horizontal(|ui| {
+            ui.add_space(16.0);
+            let label = match row.op_if_ticked {
+                Op::Install => "Install",
+                Op::Remove => "Remove",
+                Op::Keep => "Keep",
+            };
+            changed = ui.add_enabled(row.enabled, egui::Checkbox::new(tick, label)).changed();
+            if let Some(r) = &row.reason {
+                ui.colored_label(egui::Color32::GRAY, r);
+            }
+        });
+        changed
+    }
 }
 
 impl eframe::App for App {
@@ -343,6 +396,12 @@ impl eframe::App for App {
             ui.separator();
             let f = self.filter.to_lowercase();
             egui::ScrollArea::vertical().show(ui, |ui| {
+                if self.games.is_empty() {
+                    ui.label(match &self.steam_error {
+                        Some(e) => format!("{e}. Use \"Choose folder\"."),
+                        None => "No Steam games found. Use \"Choose folder\".".into(),
+                    });
+                }
                 for g in &self.games {
                     if !f.is_empty() && !g.name.to_lowercase().contains(&f) {
                         continue;
@@ -385,10 +444,11 @@ impl eframe::App for App {
 
             match &self.info {
                 None => {
-                    ui.label(if self.busy { "inspecting the game..." } else { "Pick a game on the left." });
+                    ui.label(if self.busy { "Inspecting the game..." } else { "Pick a game on the left." });
                 }
                 Some(Err(e)) => {
-                    ui.colored_label(egui::Color32::LIGHT_RED, e);
+                    ui.colored_label(egui::Color32::LIGHT_RED, format!("Cannot inspect this folder: {e}"));
+                    ui.label("Choose the folder that holds the game's own executable and try again.");
                 }
                 Some(Ok(i)) => {
                     ui.label(format!("exe: {}", i.exe.display()));
@@ -410,18 +470,66 @@ impl eframe::App for App {
                             i.present.iter().map(|(n, o)| format!("{n} ({o})")).collect();
                         ui.label(format!("proxies already in the folder: {}", taken.join(", ")));
                     }
-                    ui.separator();
-                    if let Some(s) = &self.fg_status {
-                        ui.label(format!("FG unlock: {}", s.label()));
-                    }
-                    ui.label(format!(
-                        "DLSS 5: {}",
-                        self.dlss5_status.as_ref().map(|s| s.label()).unwrap_or("not installed".into())
-                    ));
                     if let Some(f) = &self.nr_facts {
                         if let Some(d) = &f.device_lost {
                             ui.colored_label(egui::Color32::LIGHT_RED, format!("GPU device lost in the last session: {d}"));
                         }
+                    }
+                    ui.separator();
+
+                    let fg_row = self.fg_row();
+                    let d5_row = self.dlss5_row();
+                    let fg_status = self.fg_status.as_ref().map(|s| s.label()).unwrap_or_default();
+                    let d5_status = self.dlss5_status.as_ref().map(|s| s.label()).unwrap_or("not installed".into());
+
+                    Self::component_row(ui, "Frame Generation unlock", &fg_status, &fg_row, &mut self.fg_tick);
+                    if self.fg_tick && fg_row.op_if_ticked == Op::Install {
+                        ui.horizontal(|ui| {
+                            ui.add_space(40.0);
+                            ui.checkbox(&mut self.legacy, "use the legacy 0.1.0 build (some games black-screen on 0.2.x)");
+                        });
+                    }
+                    ui.add_space(6.0);
+                    Self::component_row(ui, "DLSS 5 neural rendering", &d5_status, &d5_row, &mut self.dlss5_tick);
+                    if self.dlss5_tick && d5_row.op_if_ticked == Op::Install {
+                        ui.horizontal(|ui| {
+                            ui.add_space(40.0);
+                            ui.label("route:");
+                            egui::ComboBox::from_id_salt("route")
+                                .selected_text(&self.route)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut self.route, "native".into(), "native");
+                                    ui.selectable_value(&mut self.route, "upstream".into(), "upstream");
+                                });
+                        });
+                    }
+                    ui.add_space(8.0);
+
+                    let fg_op = if self.fg_tick && fg_row.enabled { fg_row.op_if_ticked } else { Op::Keep };
+                    let d5_op = if self.dlss5_tick && d5_row.enabled { d5_row.op_if_ticked } else { Op::Keep };
+                    let installs = [fg_op, d5_op].iter().filter(|o| **o == Op::Install).count();
+                    let removes = [fg_op, d5_op].iter().filter(|o| **o == Op::Remove).count();
+                    let apply_label = match (installs, removes) {
+                        (0, 0) => "Nothing ticked".to_string(),
+                        (n, 0) => format!("Install {n}"),
+                        (0, n) => format!("Remove {n}"),
+                        (a, b) => format!("Install {a}, remove {b}"),
+                    };
+                    ui.horizontal(|ui| {
+                        let can_apply = !self.busy && (installs + removes) > 0;
+                        if ui.add_enabled(can_apply, egui::Button::new(&apply_label)).clicked() {
+                            action = Some(Action::Apply { fg: fg_op, dlss5: d5_op });
+                        }
+                        if ui.add_enabled(!self.busy, egui::Button::new("Check")).clicked() {
+                            action = Some(Action::Check);
+                        }
+                        if self.busy {
+                            ui.spinner();
+                            ui.label("working...");
+                        }
+                    });
+                    if removes > 0 {
+                        ui.colored_label(egui::Color32::GRAY, "Remove deletes only the files listed in this tool's manifest.");
                     }
                     ui.separator();
 
@@ -489,40 +597,6 @@ impl eframe::App for App {
                         ui.separator();
                     }
 
-                    let fg_ok = self.fg_allowed();
-                    ui.horizontal(|ui| {
-                        ui.add_enabled(fg_ok.is_ok(), egui::Checkbox::new(&mut self.want_fg, "DLSS Frame Generation unlock (RTX 20/30)"));
-                        if let Err(e) = &fg_ok {
-                            ui.colored_label(egui::Color32::GRAY, format!("({e})"));
-                        }
-                        ui.add_enabled(fg_ok.is_ok(), egui::Checkbox::new(&mut self.legacy, "legacy build 0.1.0"));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut self.want_dlss5, "DLSS 5 neural rendering");
-                        ui.label("route:");
-                        egui::ComboBox::from_id_salt("route")
-                            .selected_text(&self.route)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.route, "native".into(), "native");
-                                ui.selectable_value(&mut self.route, "upstream".into(), "upstream");
-                            });
-                    });
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(!self.busy, egui::Button::new("Install")).clicked() {
-                            action = Some(Action::Install);
-                        }
-                        if ui.add_enabled(!self.busy, egui::Button::new("Remove")).clicked() {
-                            action = Some(Action::Remove);
-                        }
-                        if ui.add_enabled(!self.busy, egui::Button::new("Status")).clicked() {
-                            action = Some(Action::Status);
-                        }
-                        if self.busy {
-                            ui.spinner();
-                        }
-                    });
-                    ui.add_space(6.0);
                     ui.colored_label(
                         egui::Color32::GRAY,
                         "Online games with anti-cheat can ban for this. Antivirus may quarantine the DLLs; exclude the game folder.",

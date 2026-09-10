@@ -24,11 +24,11 @@ Both are removable. Every file the tool writes is recorded in a manifest next to
 
 1. Run `rtx-unlock.exe`. Your Steam library is listed on the left. Use "Choose folder" for anything else.
 2. Select a game. The right side shows the executable, the engine, which proxy names are free and which are taken, and your GPU.
-3. Tick what you want and press Install.
+3. Each component shows its state. The checkbox next to it reads Install when it is missing and Remove when it is present. Tick what you want; the button says exactly what will happen, for example "Install 2" or "Install 1, remove 1".
 4. Launch the game.
    - Frame Generation: enable "NVIDIA DLSS Frame Generation" in the game's settings. Start with 2X.
    - DLSS 5: press Home to open ReShade, then enable neural rendering on the DLSS 5 tab. On RTX 20 and 30 the model runs in FP16 and costs roughly half your frame rate at full model resolution; lower the model resolution.
-5. Status reports what is installed and what the logs say. Remove takes it all out.
+5. Check reports what is installed and what the logs say. Removing deletes only the files listed in the tool's manifest, so a hand-made install is left alone and named as such.
 
 ## DLSS 5 settings
 

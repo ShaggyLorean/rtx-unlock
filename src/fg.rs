@@ -1,5 +1,3 @@
-//! DLSS Frame Generation unlock: the sdli1995/dlssg_for_sm86 proxy DLL.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,7 +13,6 @@ pub const PROXY_ORDER: [&str; 5] = ["version.dll", "winmm.dll", "dinput8.dll", "
 pub const MANIFEST_NAME: &str = "rtx-unlock.json";
 pub const INI_NAME: &str = "dlssg_sm86.ini";
 
-/// First proxy name the executable imports that is not already taken in the folder.
 pub fn choose_proxy(imports: &[String], present: &[String]) -> Option<&'static str> {
     PROXY_ORDER.iter().copied().find(|p| {
         imports.iter().any(|i| i.eq_ignore_ascii_case(p))
@@ -67,7 +64,6 @@ impl Manifest {
 pub enum FgStatus {
     NotInstalled,
     Installed(Manifest),
-    /// A dlssg_sm86 install this tool did not make (no manifest). Holds the ini path.
     Manual(PathBuf),
 }
 
@@ -88,8 +84,6 @@ fn reframework_plugins(root: &Path) -> PathBuf {
     root.join("reframework").join("plugins")
 }
 
-/// Installs the REFramework nightly (monolithic dinput8.dll) when it is missing.
-/// Returns the files it wrote.
 fn ensure_reframework(root: &Path, log: &dyn Fn(String)) -> Result<Vec<PathBuf>, String> {
     use std::io::Read;
     let plugins = reframework_plugins(root);
@@ -108,7 +102,6 @@ fn ensure_reframework(root: &Path, log: &dyn Fn(String)) -> Result<Vec<PathBuf>,
         fs::create_dir_all(&plugins).map_err(|e| e.to_string())?;
         return Ok(Vec::new());
     }
-    // No dinput8.dll: REFramework must be installed even if a plugins folder was left behind.
     log("RE Engine: REFramework missing, fetching the nightly build".into());
     let api = format!(
         "https://api.github.com/repos/{}/releases/latest",
@@ -319,9 +312,6 @@ mod tests {
         assert!(i.contains("MaxGeneratedFrames=3"));
     }
 
-    /// End-to-end cycle on a real game folder. Runs only with RTXU_E2E_GAME=<folder>.
-    /// A hand-made version.dll with a known hash is cleaned up first.
-    /// RTXU_E2E_CLEAN=1 removes the install at the end and leaves the folder clean.
     #[test]
     #[ignore]
     fn e2e_install_remove_install() {
@@ -350,7 +340,6 @@ mod tests {
         install(&info, &gpu, false, &log).unwrap();
         let info = crate::game::analyze(root).unwrap();
         let FgStatus::Installed(m) = status(&info) else { panic!("not reported as installed") };
-        // Unreal and others: dll + ini. RE Engine: plus the REFramework dinput8.dll.
         assert!(m.files.len() >= 2);
         for f in &m.files {
             assert!(Path::new(f).is_file(), "missing: {f}");

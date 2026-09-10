@@ -24,14 +24,10 @@ impl Engine {
 pub struct GameInfo {
     pub root: PathBuf,
     pub exe: PathBuf,
-    /// Where proxy DLLs go: the folder of the executable that actually renders.
     pub proxy_dir: PathBuf,
     pub engine: Engine,
-    /// DLL names the executable imports, lowercase.
     pub imports: Vec<String>,
-    /// Proxy names already present in proxy_dir, with their owner label.
     pub present: Vec<(String, String)>,
-    /// True when the game ships a Streamline DLSS-G DLL somewhere in its tree.
     pub dlssg: bool,
 }
 
@@ -77,7 +73,6 @@ fn lower_name(p: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Executables that live beside a game but are not the game (crash reporters, installers, launchers).
 pub fn is_helper_exe(lower_name: &str) -> bool {
     const HELPERS: [&str; 12] = [
         "crash", "report", "installer", "setup", "launcher", "unins", "redist", "vc_redist",
@@ -118,9 +113,6 @@ pub fn find_exe(root: &Path) -> Result<PathBuf, String> {
 
 pub fn imports(exe: &Path) -> Result<Vec<String>, String> {
     let data = fs::read(exe).map_err(|e| format!("cannot read executable: {e}"))?;
-    // Only the import table matters. Resources, certificates and TLS are skipped and the
-    // parser runs permissive: Denuvo-wrapped RE Engine executables have malformed resource
-    // entries that make the strict parser bail before it reaches the imports.
     let mut opts = goblin::pe::options::ParseOptions::default();
     opts.parse_attribute_certificates = false;
     opts.parse_tls_data = false;
@@ -233,7 +225,6 @@ mod tests {
         assert!(!is_helper_exe("re9demo.exe"));
     }
 
-    /// RTXU_ANALYZE=<folder> prints the analysis of any game.
     #[test]
     #[ignore]
     fn analyze_env_dir() {

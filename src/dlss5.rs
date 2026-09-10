@@ -1,5 +1,3 @@
-//! DLSS 5 Autopilot wrapper.
-
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -132,7 +130,6 @@ pub fn run(exe: &Path, args: &[String], log: &dyn Fn(String)) -> Result<i32, Str
         .map_err(|e| format!("cannot start Autopilot: {e}"))?;
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let mut stderr = child.stderr.take().ok_or("no stderr")?;
-    // stderr is collected on its own thread; stdout streams live into the log.
     let err_thread = std::thread::spawn(move || {
         let mut v = Vec::new();
         let _ = stderr.read_to_end(&mut v);

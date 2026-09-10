@@ -8,10 +8,8 @@ pub struct SteamGame {
     pub dir: PathBuf,
 }
 
-/// Steamworks Common Redistributables is not a game.
 const SKIP_APPIDS: [u32; 1] = [228980];
 
-/// Quoted tokens on one line. Handles the `\\` and `\"` escapes Valve's KeyValues use.
 fn quoted(line: &str) -> Vec<String> {
     let mut toks = Vec::new();
     let mut cur = String::new();
@@ -37,7 +35,6 @@ fn quoted(line: &str) -> Vec<String> {
     toks
 }
 
-/// Every `"key" "value"` line in order; block nesting is ignored.
 pub fn pairs(text: &str) -> Vec<(String, String)> {
     text.lines()
         .filter_map(|l| {

@@ -1,6 +1,3 @@
-//! DLSS 5 neural rendering settings: the [RenoDX.DLSS5] section of ReShade.ini,
-//! plus facts read back from ReShade.log.
-
 use std::fs;
 use std::path::Path;
 
@@ -8,8 +5,6 @@ pub const SECTION: &str = "RenoDX.DLSS5";
 pub const RESHADE_INI: &str = "ReShade.ini";
 pub const RESHADE_LOG: &str = "ReShade.log";
 
-/// Starting paper-white for engines that hand DLSS a scene-linear (pre-tonemap) buffer.
-/// On RE Engine the default of 1.0 produces a grey, washed-out frame; 16 measured well.
 pub const RE_ENGINE_PAPER_WHITE: f32 = 16.0;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -87,7 +82,6 @@ impl NrSettings {
     }
 }
 
-/// Key/value pairs of one INI section.
 pub fn read_section(text: &str, section: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut inside = false;
@@ -106,8 +100,6 @@ pub fn read_section(text: &str, section: &str) -> Vec<(String, String)> {
     out
 }
 
-/// Writes the given keys into a section (replacing existing keys, appending missing ones)
-/// without touching other sections. A missing section is appended at the end.
 pub fn write_section(text: &str, section: &str, pairs: &[(String, String)]) -> String {
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
     let header_idx = lines
@@ -141,7 +133,6 @@ pub fn write_section(text: &str, section: &str, pairs: &[(String, String)]) -> S
         match hit {
             Some(i) => body[i] = format!("{k}={v}"),
             None => {
-                // Insert before the blank lines that end the section.
                 let mut ins = body.len();
                 while ins > 0 && body[ins - 1].trim().is_empty() {
                     ins -= 1;
@@ -172,7 +163,6 @@ pub fn save(proxy_dir: &Path, s: &NrSettings) -> Result<(), String> {
     fs::write(&p, out).map_err(|e| format!("cannot write ReShade.ini: {e}"))
 }
 
-/// Writes a key only when it is absent.
 pub fn set_if_absent(proxy_dir: &Path, key: &str, value: &str) -> Result<bool, String> {
     let p = proxy_dir.join(RESHADE_INI);
     let text = fs::read_to_string(&p).map_err(|e| format!("cannot read ReShade.ini: {e}"))?;
@@ -189,15 +179,10 @@ pub fn set_if_absent(proxy_dir: &Path, key: &str, value: &str) -> Result<bool, S
 
 #[derive(Debug, Default, Clone)]
 pub struct LogFacts {
-    /// The add-on built its HDR (scene-linear) codec: paper-white matters here.
     pub hdr_codec: bool,
-    /// The add-on processed at least one NR frame.
     pub nr_evaluated: bool,
-    /// Last "active settings" line.
     pub active_settings: Option<String>,
-    /// DXGI device-removed reason (DEVICE_HUNG and friends).
     pub device_lost: Option<String>,
-    /// Driver version from ReShade's "Running on ... Driver X" line.
     pub driver: Option<String>,
 }
 
@@ -230,7 +215,6 @@ pub fn parse_log(text: &str) -> LogFacts {
     f
 }
 
-/// True for NVIDIA driver 616.64 and newer, where renodx-dlss5 4.6/4.7 fault on every evaluate.
 pub fn driver_faults_new_addon(driver: &str) -> bool {
     let mut it = driver.split('.');
     let major: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -298,7 +282,6 @@ mod tests {
         assert!(f.active_settings.unwrap().contains("paper_white"));
     }
 
-    /// RTXU_NR_DIR=<exe folder> prints what the module reads from a real ReShade.ini and log.
     #[test]
     #[ignore]
     fn nr_env_dir() {
