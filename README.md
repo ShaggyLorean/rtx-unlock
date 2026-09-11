@@ -22,7 +22,7 @@ Both are removable. Every file the tool writes is recorded in a manifest next to
 
 ## Use
 
-1. Run `rtx-unlock.exe`. Your Steam library is listed on the left. Use "Choose folder" for anything else.
+1. Run `rtx-unlock.exe`. Your Steam library is listed on the left. For anything else, "Add game (.exe)" picks the game's executable and keeps it in the list under "Added"; "Open folder" inspects a folder once without saving it.
 2. Select a game. The right side shows the executable, the engine, which proxy names are free and which are taken, and your GPU.
 3. Each component shows its state. The checkbox next to it reads Install when it is missing and Remove when it is present. Tick what you want; the button says exactly what will happen, for example "Install 2" or "Install 1, remove 1".
 4. Launch the game.
@@ -30,7 +30,7 @@ Both are removable. Every file the tool writes is recorded in a manifest next to
    - DLSS 5: press Home to open ReShade, then enable neural rendering on the DLSS 5 tab. On RTX 20 and 30 the model runs in FP16 and costs roughly half your frame rate at full model resolution; lower the model resolution.
 5. Check reports what is installed and what the logs say. Removing deletes only the files listed in the tool's manifest, so a hand-made install is left alone and named as such.
 
-A folder path on the command line selects that game at startup: `rtx-unlock.exe "D:\Games\Bodycam"`.
+A folder or an .exe path on the command line selects that game at startup: `rtx-unlock.exe "D:\Games\Bodycam"` or `rtx-unlock.exe "D:\Games\Ravage\Binaries\Win64\Halloween.exe"`. Added games are stored in `%LOCALAPPDATA%tx-unlock\games.json`; removing one from the list touches nothing in the game folder.
 
 ## Updates
 

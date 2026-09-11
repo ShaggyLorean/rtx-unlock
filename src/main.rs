@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod custom;
 mod dlss5;
 mod download;
 mod fg;
