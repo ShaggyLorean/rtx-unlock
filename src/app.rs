@@ -4,6 +4,7 @@ use std::thread;
 
 use eframe::egui;
 
+use crate::custom::{self, CustomGame};
 use crate::dlss5::{self, Dlss5State};
 use crate::fg::{self, FgStatus};
 use crate::game::{self, GameInfo};
@@ -11,6 +12,24 @@ use crate::gpu::{self, Gpu, GpuClass};
 use crate::nr::{self, LogFacts, NrSettings};
 use crate::steam::{self, SteamGame};
 use crate::update::{self, Release};
+
+#[derive(Clone, PartialEq, Eq)]
+enum Target {
+    Folder(PathBuf),
+    Exe(PathBuf),
+}
+
+impl Target {
+    fn from_arg(p: PathBuf) -> Option<Target> {
+        if p.is_file() {
+            Some(Target::Exe(p))
+        } else if p.is_dir() {
+            Some(Target::Folder(p))
+        } else {
+            None
+        }
+    }
+}
 
 enum Msg {
     Log(String),
@@ -52,9 +71,10 @@ struct Row {
 
 pub struct App {
     games: Vec<SteamGame>,
+    custom: Vec<CustomGame>,
     steam_error: Option<String>,
     filter: String,
-    selected: Option<PathBuf>,
+    selected: Option<Target>,
     info: Option<Result<GameInfo, String>>,
     gpu: Result<Gpu, String>,
     fg_tick: bool,
@@ -82,6 +102,7 @@ impl App {
         let gpu = gpu::detect();
         let mut app = Self {
             games,
+            custom: custom::load(),
             steam_error,
             filter: String::new(),
             selected: None,
@@ -119,10 +140,9 @@ impl App {
         } else {
             app.push("DLSS 5 Autopilot: not present, downloaded on the first DLSS 5 install".into());
         }
-        if let Some(dir) = std::env::args().nth(1) {
-            let p = PathBuf::from(dir);
-            if p.is_dir() {
-                app.select(p);
+        if let Some(arg) = std::env::args().nth(1) {
+            if let Some(t) = Target::from_arg(PathBuf::from(arg)) {
+                app.select(t);
             }
         }
         app
@@ -225,23 +245,53 @@ impl App {
         }
     }
 
-    fn select(&mut self, dir: PathBuf) {
+    fn add_custom(&mut self, exe: PathBuf) -> Target {
+        let i = custom::add(&mut self.custom, exe);
+        match custom::save(&self.custom) {
+            Ok(()) => self.push(format!("added to the list: {}", self.custom[i].name)),
+            Err(e) => self.push(format!("ERROR [game list]: {e}")),
+        }
+        Target::Exe(self.custom[i].exe.clone())
+    }
+
+    fn remove_custom(&mut self, idx: usize) {
+        if idx >= self.custom.len() {
+            return;
+        }
+        let g = self.custom.remove(idx);
+        match custom::save(&self.custom) {
+            Ok(()) => self.push(format!("removed from the list: {} (nothing in the game folder was touched)", g.name)),
+            Err(e) => self.push(format!("ERROR [game list]: {e}")),
+        }
+        if self.selected == Some(Target::Exe(g.exe)) {
+            self.selected = None;
+            self.info = None;
+        }
+    }
+
+    fn select(&mut self, target: Target) {
         if self.busy {
             return;
         }
-        self.selected = Some(dir.clone());
+        self.selected = Some(target.clone());
         self.info = None;
         self.fg_status = None;
         self.dlss5_status = None;
         self.nr = None;
         self.nr_facts = None;
         self.nr_dirty = false;
-        self.push(format!("--- {}", dir.display()));
+        let shown = match &target {
+            Target::Folder(p) | Target::Exe(p) => p.display().to_string(),
+        };
+        self.push(format!("--- {shown}"));
         let (tx, rx) = channel();
         self.rx = Some(rx);
         self.busy = true;
         thread::spawn(move || {
-            let r = game::analyze(&dir);
+            let r = match &target {
+                Target::Folder(d) => game::analyze(d),
+                Target::Exe(e) => game::analyze_exe(e),
+            };
             let _ = tx.send(Msg::Analyzed(Box::new(r)));
             let _ = tx.send(Msg::Done);
         });
@@ -462,7 +512,9 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
-        let mut pick: Option<PathBuf> = None;
+        let mut pick: Option<Target> = None;
+        let mut add_exe: Option<PathBuf> = None;
+        let mut remove_idx: Option<usize> = None;
         let mut do_update = false;
         let banner = match &self.update {
             UpdateState::Available(r) => Some((format!("Version {} is available.", r.version), true)),
@@ -487,27 +539,57 @@ impl eframe::App for App {
                 ui.label("Search:");
                 ui.text_edit_singleline(&mut self.filter);
             });
-            if ui.add_enabled(!self.busy, egui::Button::new("Choose folder...")).clicked() {
-                if let Some(d) = rfd::FileDialog::new().pick_folder() {
-                    pick = Some(d);
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!self.busy, egui::Button::new("Add game (.exe)...")).clicked() {
+                    if let Some(e) = rfd::FileDialog::new().add_filter("Executable", &["exe"]).pick_file() {
+                        add_exe = Some(e);
+                    }
                 }
-            }
+                if ui.add_enabled(!self.busy, egui::Button::new("Open folder...")).clicked() {
+                    if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                        pick = Some(Target::Folder(d));
+                    }
+                }
+            });
             ui.separator();
             let f = self.filter.to_lowercase();
             egui::ScrollArea::vertical().show(ui, |ui| {
-                if self.games.is_empty() {
+                if self.games.is_empty() && self.custom.is_empty() {
                     ui.label(match &self.steam_error {
-                        Some(e) => format!("{e}. Use \"Choose folder\"."),
-                        None => "No Steam games found. Use \"Choose folder\".".into(),
+                        Some(e) => format!("{e}. Add a game with its .exe."),
+                        None => "No Steam games found. Add a game with its .exe.".into(),
                     });
+                }
+                if !self.custom.is_empty() {
+                    ui.label(egui::RichText::new("Added").weak());
+                    for (i, g) in self.custom.iter().enumerate() {
+                        if !f.is_empty() && !g.name.to_lowercase().contains(&f) {
+                            continue;
+                        }
+                        let t = Target::Exe(g.exe.clone());
+                        let sel = self.selected.as_ref() == Some(&t);
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label(sel, &g.name).on_hover_text(g.exe.display().to_string()).clicked() && !sel {
+                                pick = Some(t.clone());
+                            }
+                            if ui.add_enabled(!self.busy, egui::Button::new("x").small()).on_hover_text("remove from this list").clicked() {
+                                remove_idx = Some(i);
+                            }
+                        });
+                    }
+                    if !self.games.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("Steam").weak());
+                    }
                 }
                 for g in &self.games {
                     if !f.is_empty() && !g.name.to_lowercase().contains(&f) {
                         continue;
                     }
-                    let sel = self.selected.as_ref() == Some(&g.dir);
+                    let t = Target::Folder(g.dir.clone());
+                    let sel = self.selected.as_ref() == Some(&t);
                     if ui.selectable_label(sel, &g.name).clicked() && !sel {
-                        pick = Some(g.dir.clone());
+                        pick = Some(t);
                     }
                 }
             });
@@ -719,8 +801,15 @@ impl eframe::App for App {
         if do_update {
             self.start_update();
         }
-        if let Some(d) = pick {
-            self.select(d);
+        if let Some(i) = remove_idx {
+            self.remove_custom(i);
+        }
+        if let Some(e) = add_exe {
+            let t = self.add_custom(e);
+            pick = Some(t);
+        }
+        if let Some(t) = pick {
+            self.select(t);
         }
         if nr_save {
             self.save_nr();

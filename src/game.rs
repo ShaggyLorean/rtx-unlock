@@ -193,11 +193,34 @@ pub fn present_proxies(proxy_dir: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
+pub fn root_for_exe(exe: &Path) -> PathBuf {
+    let dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
+    let lower = dir.to_string_lossy().to_ascii_lowercase();
+    if lower.ends_with("\\binaries\\win64") {
+        if let Some(root) = dir.parent().and_then(Path::parent).and_then(Path::parent) {
+            return root.to_path_buf();
+        }
+    }
+    dir
+}
+
 pub fn analyze(root: &Path) -> Result<GameInfo, String> {
     if !root.is_dir() {
         return Err(format!("folder does not exist: {}", root.display()));
     }
     let exe = find_exe(root)?;
+    analyze_with(root, exe)
+}
+
+pub fn analyze_exe(exe: &Path) -> Result<GameInfo, String> {
+    if !exe.is_file() {
+        return Err(format!("executable does not exist: {}", exe.display()));
+    }
+    let root = root_for_exe(exe);
+    analyze_with(&root, exe.to_path_buf())
+}
+
+fn analyze_with(root: &Path, exe: PathBuf) -> Result<GameInfo, String> {
     let proxy_dir = exe
         .parent()
         .map(Path::to_path_buf)
@@ -259,6 +282,15 @@ mod tests {
     }
 
     #[test]
+    fn root_from_exe_layouts() {
+        assert_eq!(
+            root_for_exe(Path::new(r"D:\G\Halloween\Ravage\Binaries\Win64\Halloween.exe")),
+            PathBuf::from(r"D:\G\Halloween")
+        );
+        assert_eq!(root_for_exe(Path::new(r"D:\G\Flat\game.exe")), PathBuf::from(r"D:\G\Flat"));
+    }
+
+    #[test]
     fn helper_exes_are_skipped() {
         assert!(is_helper_exe("crashreport.exe"));
         assert!(is_helper_exe("installermessage.exe"));
@@ -269,7 +301,9 @@ mod tests {
     #[ignore]
     fn analyze_env_dir() {
         let Ok(dir) = std::env::var("RTXU_ANALYZE") else { return };
-        let i = analyze(Path::new(&dir)).unwrap();
+        let p = Path::new(&dir);
+        let i = if p.is_file() { analyze_exe(p).unwrap() } else { analyze(p).unwrap() };
+        eprintln!("root: {}", i.root.display());
         eprintln!("exe: {}", i.exe.display());
         eprintln!("engine: {:?}", i.engine);
         eprintln!("dlssg: {}", i.dlssg);
