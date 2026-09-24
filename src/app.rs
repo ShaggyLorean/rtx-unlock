@@ -10,6 +10,7 @@ use crate::fg::{self, FgStatus};
 use crate::game::{self, GameInfo};
 use crate::gpu::{self, Gpu, GpuClass};
 use crate::nr::{self, LogFacts, NrSettings};
+use crate::sources::Runtime;
 use crate::steam::{self, SteamGame};
 use crate::update::{self, Release};
 
@@ -79,7 +80,8 @@ pub struct App {
     gpu: Result<Gpu, String>,
     fg_tick: bool,
     dlss5_tick: bool,
-    legacy: bool,
+    runtime: Runtime,
+    max_frames: u32,
     route: String,
     log: Vec<String>,
     busy: bool,
@@ -110,7 +112,8 @@ impl App {
             gpu,
             fg_tick: false,
             dlss5_tick: false,
-            legacy: false,
+            runtime: Runtime::Dlssg3109,
+            max_frames: 3,
             route: "native".into(),
             log: Vec::new(),
             busy: false,
@@ -371,7 +374,8 @@ impl App {
     fn start(&mut self, action: Action) {
         let Some(Ok(info)) = self.info.clone() else { return };
         let gpu = self.gpu.clone();
-        let legacy = self.legacy;
+        let runtime = self.runtime;
+        let max_frames = self.max_frames;
         let route = self.route.clone();
         let (tx, rx) = channel();
         self.rx = Some(rx);
@@ -393,7 +397,7 @@ impl App {
                     let mut ok = true;
                     match fg_op {
                         Op::Install => match &gpu {
-                            Ok(g) => ok = step("FG unlock", fg::install(&info, g, legacy, &log)),
+                            Ok(g) => ok = step("FG unlock", fg::install(&info, g, runtime, max_frames, &log)),
                             Err(e) => ok = step("FG unlock", Err(e.clone())),
                         },
                         Op::Remove => {
@@ -638,24 +642,44 @@ impl eframe::App for App {
                         "DLSS-G DLL: {}",
                         if i.dlssg { "present" } else { "missing (the game has no DLSS Frame Generation of its own)" }
                     ));
-                    let imported: Vec<&str> = fg::PROXY_ORDER
-                        .iter()
-                        .copied()
-                        .filter(|p| i.imports.iter().any(|x| x == p))
-                        .collect();
-                    ui.label(format!("proxy names the exe loads: {}", imported.join(", ")));
                     if let Some(ac) = i.anticheat {
                         ui.colored_label(
                             egui::Color32::LIGHT_RED,
                             format!("{ac} is present. It can refuse to start the game with a proxy DLL in place, and online play with one can get the account banned."),
                         );
                     }
-                    if i.present.is_empty() {
-                        ui.label("proxies already in the folder: none");
-                    } else {
-                        let taken: Vec<String> =
-                            i.present.iter().map(|(n, o)| format!("{n} ({o})")).collect();
-                        ui.label(format!("proxies already in the folder: {}", taken.join(", ")));
+                    ui.add_space(4.0);
+                    ui.label("Proxy names this executable can load:");
+                    let chosen = fg::choose_proxy(&i.slots, self.runtime);
+                    egui::Grid::new("proxies").striped(true).spacing([16.0, 2.0]).show(ui, |ui| {
+                        ui.strong("name");
+                        ui.strong("how the game loads it");
+                        ui.strong("in the folder");
+                        ui.strong("verdict");
+                        ui.end_row();
+                        for s in &i.slots {
+                            ui.monospace(s.name);
+                            ui.label(s.load.label());
+                            ui.label(s.owner.as_deref().unwrap_or("free"));
+                            let v = s.verdict();
+                            if chosen == Some(s.name) {
+                                ui.colored_label(egui::Color32::LIGHT_GREEN, format!("{v}, chosen"));
+                            } else if s.usable() {
+                                ui.label(v);
+                            } else {
+                                ui.colored_label(egui::Color32::GRAY, v);
+                            }
+                            ui.end_row();
+                        }
+                    });
+                    let others: Vec<String> = i
+                        .present
+                        .iter()
+                        .filter(|(n, _)| !i.slots.iter().any(|s| s.name == n))
+                        .map(|(n, o)| format!("{n} ({o})"))
+                        .collect();
+                    if !others.is_empty() {
+                        ui.label(format!("other proxies in the folder: {}", others.join(", ")));
                     }
                     if let Some(f) = &self.nr_facts {
                         if let Some(d) = &f.device_lost {
@@ -673,8 +697,33 @@ impl eframe::App for App {
                     if self.fg_tick && fg_row.op_if_ticked == Op::Install {
                         ui.horizontal(|ui| {
                             ui.add_space(40.0);
-                            ui.checkbox(&mut self.legacy, "use the legacy 0.1.0 build (some games black-screen on 0.2.x)");
+                            ui.label("build:");
+                            egui::ComboBox::from_id_salt("runtime")
+                                .selected_text(self.runtime.label())
+                                .show_ui(ui, |ui| {
+                                    for r in Runtime::ALL {
+                                        ui.selectable_value(&mut self.runtime, r, r.label());
+                                    }
+                                });
+                            let ceiling = self.runtime.max_generated_frames();
+                            if self.max_frames > ceiling {
+                                self.max_frames = ceiling;
+                            }
+                            ui.label("up to:");
+                            egui::ComboBox::from_id_salt("frames")
+                                .selected_text(format!("{}X", self.max_frames + 1))
+                                .show_ui(ui, |ui| {
+                                    for n in 1..=ceiling {
+                                        ui.selectable_value(&mut self.max_frames, n, format!("{}X", n + 1));
+                                    }
+                                });
                         });
+                        if fg::choose_proxy(&i.slots, self.runtime).is_none() {
+                            ui.horizontal(|ui| {
+                                ui.add_space(40.0);
+                                ui.colored_label(egui::Color32::YELLOW, fg::no_proxy_message(&i.slots, self.runtime));
+                            });
+                        }
                     }
                     ui.add_space(6.0);
                     Self::component_row(ui, "DLSS 5 neural rendering", &d5_status, &d5_row, &mut self.dlss5_tick);
@@ -791,7 +840,7 @@ impl eframe::App for App {
                     if i.engine == game::Engine::ReEngine {
                         ui.colored_label(
                             egui::Color32::GRAY,
-                            "RE Engine: the FG unlock goes into reframework\\plugins. If REFramework is missing, the nightly dinput8.dll is installed for you.",
+                            "RE Engine: when no proxy name is free, the FG unlock goes into reframework\\plugins; the nightly REFramework dinput8.dll is installed if it is missing.",
                         );
                     }
                 }

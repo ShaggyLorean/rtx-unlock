@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::sources::{ALL_PROXIES, PROXY_FAMILY};
 use crate::winutil::original_filename;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,10 +15,78 @@ impl Engine {
     pub fn label(self) -> &'static str {
         match self {
             Engine::Unreal => "Unreal Engine",
-            Engine::ReEngine => "RE Engine (needs REFramework)",
+            Engine::ReEngine => "RE Engine",
             Engine::Unknown => "unknown",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Load {
+    Import,
+    DelayLoad,
+    Reference,
+    Never,
+}
+
+impl Load {
+    pub fn label(self) -> &'static str {
+        match self {
+            Load::Import => "imported at startup",
+            Load::DelayLoad => "delay-loaded on first use",
+            Load::Reference => "only named in the executable",
+            Load::Never => "not referenced",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProxySlot {
+    pub name: &'static str,
+    pub load: Load,
+    pub known_dll: bool,
+    pub owner: Option<String>,
+}
+
+impl ProxySlot {
+    pub fn free(&self) -> bool {
+        self.owner.is_none() && !self.known_dll
+    }
+
+    pub fn loads(&self) -> bool {
+        matches!(self.load, Load::Import | Load::DelayLoad)
+    }
+
+    pub fn usable(&self) -> bool {
+        self.free() && self.loads()
+    }
+
+    pub fn is_family(&self) -> bool {
+        PROXY_FAMILY.contains(&self.name)
+    }
+
+    pub fn verdict(&self) -> String {
+        if self.known_dll {
+            return "Windows KnownDLL, the system copy always wins".into();
+        }
+        if let Some(o) = &self.owner {
+            return format!("taken by {o}");
+        }
+        match self.load {
+            Load::Import if self.is_family() => "usable".into(),
+            Load::Import => "usable, render path".into(),
+            Load::DelayLoad => "usable, may load too late".into(),
+            Load::Reference => "unclear, not chosen automatically".into(),
+            Load::Never => "never loaded".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ExeLoads {
+    pub imports: Vec<String>,
+    pub delay: Vec<String>,
+    pub references: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -26,7 +95,7 @@ pub struct GameInfo {
     pub exe: PathBuf,
     pub proxy_dir: PathBuf,
     pub engine: Engine,
-    pub imports: Vec<String>,
+    pub slots: Vec<ProxySlot>,
     pub present: Vec<(String, String)>,
     pub dlssg: bool,
     pub anticheat: Option<&'static str>,
@@ -42,15 +111,17 @@ pub fn detect_anticheat(root: &Path) -> Option<&'static str> {
     None
 }
 
-pub const PROXY_NAMES: [&str; 8] = [
+pub const PROXY_NAMES: [&str; 10] = [
     "version.dll",
     "winmm.dll",
+    "dbghelp.dll",
     "dinput8.dll",
-    "winhttp.dll",
     "dxgi.dll",
+    "d3d12.dll",
+    "winhttp.dll",
     "dwmapi.dll",
     "wininet.dll",
-    "d3d12.dll",
+    "xinput1_3.dll",
 ];
 
 fn walk(dir: &Path, depth: usize, f: &mut dyn FnMut(&Path) -> bool) -> bool {
@@ -134,7 +205,69 @@ pub fn find_exe(root: &Path) -> Result<PathBuf, String> {
         .ok_or_else(|| format!("no executable found in {}", root.display()))
 }
 
-pub fn imports(exe: &Path) -> Result<Vec<String>, String> {
+fn rva_to_offset(sections: &[goblin::pe::section_table::SectionTable], rva: u32) -> Option<usize> {
+    sections.iter().find_map(|s| {
+        let span = s.virtual_size.max(s.size_of_raw_data);
+        (rva >= s.virtual_address && rva < s.virtual_address.saturating_add(span))
+            .then(|| (rva - s.virtual_address + s.pointer_to_raw_data) as usize)
+    })
+}
+
+fn c_string_at(data: &[u8], offset: usize) -> Option<String> {
+    let rest = data.get(offset..)?;
+    let end = rest.iter().position(|&b| b == 0)?;
+    Some(String::from_utf8_lossy(&rest[..end]).to_ascii_lowercase())
+}
+
+fn delay_loaded(data: &[u8], pe: &goblin::pe::PE) -> Vec<String> {
+    const DELAY_IMPORT_DIRECTORY: usize = 13;
+    const ENTRY_SIZE: usize = 32;
+    let mut out = Vec::new();
+    let Some(opt) = pe.header.optional_header.as_ref() else {
+        return out;
+    };
+    let Some(Some((_, dir))) = opt.data_directories.data_directories.get(DELAY_IMPORT_DIRECTORY) else {
+        return out;
+    };
+    let Some(mut off) = rva_to_offset(&pe.sections, dir.virtual_address) else {
+        return out;
+    };
+    while let Some(entry) = data.get(off..off + ENTRY_SIZE) {
+        let name_rva = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
+        if name_rva == 0 {
+            break;
+        }
+        if let Some(name) = rva_to_offset(&pe.sections, name_rva).and_then(|o| c_string_at(data, o)) {
+            out.push(name);
+        }
+        off += ENTRY_SIZE;
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return false;
+    }
+    hay.windows(needle.len())
+        .any(|w| w.iter().zip(needle).all(|(a, b)| a.eq_ignore_ascii_case(b)))
+}
+
+fn utf16(s: &str) -> Vec<u8> {
+    s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
+}
+
+fn referenced_names(data: &[u8], names: &[&str]) -> Vec<String> {
+    names
+        .iter()
+        .filter(|n| contains_ci(data, n.as_bytes()) || contains_ci(data, &utf16(n)))
+        .map(|n| n.to_string())
+        .collect()
+}
+
+pub fn exe_loads(exe: &Path) -> Result<ExeLoads, String> {
     let data = fs::read(exe).map_err(|e| format!("cannot read executable: {e}"))?;
     let mut opts = goblin::pe::options::ParseOptions::default();
     opts.parse_attribute_certificates = false;
@@ -143,10 +276,53 @@ pub fn imports(exe: &Path) -> Result<Vec<String>, String> {
     opts.parse_mode = goblin::options::ParseMode::Permissive;
     let pe = goblin::pe::PE::parse_with_opts(&data, &opts)
         .map_err(|e| format!("cannot parse PE: {e}"))?;
-    let mut v: Vec<String> = pe.libraries.iter().map(|s| s.to_ascii_lowercase()).collect();
-    v.sort();
-    v.dedup();
-    Ok(v)
+    let mut imports: Vec<String> = pe.libraries.iter().map(|s| s.to_ascii_lowercase()).collect();
+    imports.sort();
+    imports.dedup();
+    let delay = delay_loaded(&data, &pe);
+    let references = referenced_names(&data, &ALL_PROXIES);
+    Ok(ExeLoads { imports, delay, references })
+}
+
+pub fn known_dlls() -> Vec<String> {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+    let Ok(key) = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey(r"SYSTEM\CurrentControlSet\Control\Session Manager\KnownDLLs")
+    else {
+        return Vec::new();
+    };
+    key.enum_values()
+        .flatten()
+        .filter_map(|(_, v)| {
+            let s = v.to_string().trim_matches('"').to_ascii_lowercase();
+            s.ends_with(".dll").then_some(s)
+        })
+        .collect()
+}
+
+pub fn proxy_slots(loads: &ExeLoads, proxy_dir: &Path, known: &[String]) -> Vec<ProxySlot> {
+    let has_ini = proxy_dir.join("dlssg_sm86.ini").exists();
+    ALL_PROXIES
+        .iter()
+        .map(|&name| {
+            let has = |v: &[String]| v.iter().any(|x| x.eq_ignore_ascii_case(name));
+            let load = if has(&loads.imports) {
+                Load::Import
+            } else if has(&loads.delay) {
+                Load::DelayLoad
+            } else if has(&loads.references) {
+                Load::Reference
+            } else {
+                Load::Never
+            };
+            let path = proxy_dir.join(name);
+            let owner = path
+                .is_file()
+                .then(|| label_for(original_filename(&path).as_deref(), has_ini));
+            ProxySlot { name, load, known_dll: has(known), owner }
+        })
+        .collect()
 }
 
 pub fn detect_engine(root: &Path, exe: &Path) -> Engine {
@@ -225,9 +401,10 @@ fn analyze_with(root: &Path, exe: PathBuf) -> Result<GameInfo, String> {
         .parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| "executable has no parent folder".to_string())?;
-    let imports = imports(&exe)?;
+    let loads = exe_loads(&exe)?;
     let engine = detect_engine(root, &exe);
     let present = present_proxies(&proxy_dir);
+    let slots = proxy_slots(&loads, &proxy_dir, &known_dlls());
     let dlssg = dlssg_present(root);
     let anticheat = detect_anticheat(root);
     Ok(GameInfo {
@@ -235,7 +412,7 @@ fn analyze_with(root: &Path, exe: PathBuf) -> Result<GameInfo, String> {
         exe,
         proxy_dir,
         engine,
-        imports,
+        slots,
         present,
         dlssg,
         anticheat,
@@ -298,6 +475,40 @@ mod tests {
     }
 
     #[test]
+    fn name_scan_is_case_insensitive_and_utf16() {
+        let mut data = b"...VERSION.DLL...".to_vec();
+        data.extend(utf16("d3d12.dll"));
+        let r = referenced_names(&data, &ALL_PROXIES);
+        assert_eq!(r, vec!["version.dll".to_string(), "d3d12.dll".to_string()]);
+        assert!(!contains_ci(b"short", b"much longer needle"));
+    }
+
+    #[test]
+    fn slots_rank_evidence_and_owners() {
+        let tmp = std::env::temp_dir().join(format!("rtxu-slots-{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("winmm.dll"), b"x").unwrap();
+        let loads = ExeLoads {
+            imports: vec!["version.dll".into(), "winmm.dll".into(), "dxgi.dll".into()],
+            delay: vec!["dbghelp.dll".into()],
+            references: vec!["dinput8.dll".into()],
+        };
+        let known = vec!["dinput8.dll".to_string()];
+        let slots = proxy_slots(&loads, &tmp, &known);
+        let get = |n: &str| slots.iter().find(|s| s.name == n).unwrap();
+        assert!(get("version.dll").usable());
+        assert_eq!(get("winmm.dll").owner.as_deref(), Some("unknown"));
+        assert!(!get("winmm.dll").usable());
+        assert_eq!(get("dbghelp.dll").load, Load::DelayLoad);
+        assert!(get("dbghelp.dll").usable());
+        assert!(get("dinput8.dll").known_dll);
+        assert!(!get("dinput8.dll").usable());
+        assert_eq!(get("dxgi.dll").verdict(), "usable, render path");
+        assert_eq!(get("d3d12.dll").load, Load::Never);
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
     #[ignore]
     fn analyze_env_dir() {
         let Ok(dir) = std::env::var("RTXU_ANALYZE") else { return };
@@ -308,7 +519,9 @@ mod tests {
         eprintln!("engine: {:?}", i.engine);
         eprintln!("dlssg: {}", i.dlssg);
         eprintln!("anticheat: {:?}", i.anticheat);
-        eprintln!("imports: {}", i.imports.join(", "));
+        for s in &i.slots {
+            eprintln!("{:12} {:28} {:<24} {}", s.name, s.load.label(), s.owner.clone().unwrap_or_default(), s.verdict());
+        }
         eprintln!("present: {:?}", i.present);
     }
 
@@ -318,7 +531,10 @@ mod tests {
         let i = analyze(Path::new(r"D:\SteamLibrary\steamapps\common\Bodycam")).unwrap();
         assert!(i.exe.ends_with("Bodycam-Win64-Shipping.exe"));
         assert_eq!(i.engine, Engine::Unreal);
-        assert!(i.imports.contains(&"version.dll".to_string()));
+        let version = i.slots.iter().find(|s| s.name == "version.dll").unwrap();
+        assert_eq!(version.load, Load::Import);
+        let dbghelp = i.slots.iter().find(|s| s.name == "dbghelp.dll").unwrap();
+        assert_eq!(dbghelp.load, Load::DelayLoad);
         assert!(i.dlssg);
         assert!(i.present.iter().any(|(n, o)| n == "dwmapi.dll" && o == "UE4SS"));
     }
