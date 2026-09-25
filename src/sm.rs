@@ -216,7 +216,6 @@ pub struct RunFacts {
     pub file: String,
     pub attached: bool,
     pub nvp_init: bool,
-    pub wrapped: bool,
     pub passthrough: bool,
     pub load_failures: usize,
     pub presents: u64,
@@ -228,9 +227,9 @@ impl RunFacts {
         if !self.attached {
             return format!("{}: the proxy did not start", self.file);
         }
-        if self.wrapped && self.graphs > 0 {
+        if self.graphs > 0 {
             let mut s = format!(
-                "{}: working, the swapchain was wrapped and {} frames were generated ({} presents)",
+                "{}: working, {} frames generated ({} presents)",
                 self.file, self.graphs, self.presents
             );
             if self.load_failures > 0 {
@@ -244,7 +243,7 @@ impl RunFacts {
         if self.load_failures > 0 {
             return format!("{}: {} CUDA module loads failed, no frames generated", self.file, self.load_failures);
         }
-        if self.passthrough && !self.wrapped {
+        if self.passthrough {
             return format!(
                 "{}: the game's swapchain was not wrapped (passthrough); the game may create its device before the proxy loads",
                 self.file
@@ -268,9 +267,6 @@ pub fn parse_log(file: &str, text: &str) -> RunFacts {
         }
         if line.contains("NVP_Init_D3D() -> TRUE") {
             f.nvp_init = true;
-        }
-        if line.contains("verified as NvPresent proxy") {
-            f.wrapped = true;
         }
         if line.contains("passthrough active") {
             f.passthrough = true;
@@ -356,7 +352,7 @@ mod tests {
             [5] HookedPresent #120: sync=0 -> hr=0 (graphs=60)\n\
             [6] HookedPresent #240: sync=0 -> hr=0 (graphs=120)\n";
         let f = parse_log("a.log", working);
-        assert!(f.attached && f.nvp_init && f.wrapped && f.passthrough);
+        assert!(f.attached && f.nvp_init && f.passthrough);
         assert_eq!((f.presents, f.graphs, f.load_failures), (240, 120, 0));
         assert!(f.summary().contains("working"));
         let stuck = "[ATTACH]\nNVP_Init_D3D() -> TRUE\npassthrough active\nHookedPresent #9: (graphs=0)\n";

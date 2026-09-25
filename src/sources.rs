@@ -8,7 +8,7 @@ pub const AUTOPILOT_REPO: &str = "Kizzuwatnaa/DLSS5-Autopilot";
 pub const REFRAMEWORK_REPO: &str = "praydog/REFramework-nightly";
 pub const REFRAMEWORK_ASSET: &str = "REFramework.zip";
 
-pub const SM_REPO: &str = "ShaggyLorean/smooth-motion-rtx30-winmm";
+pub const SM_REPO: &str = "ShaggyLorean/smooth-motion-rtx30";
 pub const SM_VERSION: &str = "0.2.0";
 pub const SM_TESTED_DRIVER: &str = "616.92";
 
@@ -172,7 +172,7 @@ pub fn fg_source(proxy: &str, runtime: Runtime) -> Option<Source> {
 macro_rules! sm_asset {
     ($name:literal) => {
         concat!(
-            "https://github.com/ShaggyLorean/smooth-motion-rtx30-winmm/releases/download/v0.2.0/",
+            "https://github.com/ShaggyLorean/smooth-motion-rtx30/releases/download/v0.2.0/",
             $name
         )
     };

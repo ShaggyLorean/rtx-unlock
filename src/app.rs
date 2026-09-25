@@ -867,7 +867,7 @@ impl eframe::App for App {
                         }
                         if self.sm_status.as_ref().is_some_and(|s| s.present()) {
                             if let Some(r) = &self.sm_run {
-                                let working = r.wrapped && r.graphs > 0;
+                                let working = r.graphs > 0;
                                 ui.horizontal(|ui| {
                                     ui.add_space(16.0);
                                     ui.colored_label(

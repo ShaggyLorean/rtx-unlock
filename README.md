@@ -10,7 +10,7 @@
 
 **Frame Generation unlock.** Games that ship Streamline DLSS-G hide the option on Turing and Ampere. rtx-unlock reads the game's executable, works out which proxy DLL names it loads, places the [dlssg_for_sm86](https://github.com/sdli1995/dlssg_for_sm86) 0.3.5 proxy under the safest free one and writes its ini. The proxy carries its own DLSS-G runtime, so the game's own Frame Generation setting appears and works, up to 6X on the 310.9 build.
 
-**Smooth Motion.** For games without DLSS-G of their own. NVIDIA's driver-side frame generation is locked to RTX 40 and 50; the [smooth-motion-rtx30-winmm](https://github.com/ShaggyLorean/smooth-motion-rtx30-winmm) proxy runs it on RTX 30. That proxy is built under eleven DLL names, and rtx-unlock installs the one the game's executable imports at startup. Nothing needs to be enabled in the game.
+**Smooth Motion.** For games without DLSS-G of their own. NVIDIA's driver-side frame generation is locked to RTX 40 and 50; the [smooth-motion-rtx30](https://github.com/ShaggyLorean/smooth-motion-rtx30) proxy runs it on RTX 30. That proxy is built under eleven DLL names, and rtx-unlock installs the one the game's executable imports at startup. Nothing needs to be enabled in the game.
 
 **DLSS 5 neural rendering.** rtx-unlock runs [DLSS 5 Autopilot](https://github.com/Kizzuwatnaa/DLSS5-Autopilot) in the background on its native route: ReShade, the renodx-dlss5 add-on and the nvngx_dlssnr build that matches your driver. Autopilot is fetched from GitHub and checked against its SHA-256 sums.
 
@@ -30,7 +30,7 @@ All three are removable. Every file the tool writes is recorded in a manifest ne
 3. Each component shows its state. The checkbox next to it reads Install when it is missing and Remove when it is present. With the FG unlock ticked you can pick the build and the multiplier ceiling. Ticking the FG unlock clears the Smooth Motion tick and the other way round. Tick what you want; the button says exactly what will happen, for example "Install 2" or "Install 1, remove 1".
 4. Launch the game.
    - Frame Generation: enable "NVIDIA DLSS Frame Generation" in the game's settings. Start with 2X.
-   - Smooth Motion: nothing to enable. The proxy writes `logs\sm86_proxy_<pid>.log` next to the executable; Check reads the newest one and says whether the swapchain was wrapped and how many frames were generated.
+   - Smooth Motion: nothing to enable. The proxy writes `logs\sm86_proxy_<pid>.log` next to the executable; Check reads the newest one and says how many frames were generated.
    - DLSS 5: press Home to open ReShade, then enable neural rendering on the DLSS 5 tab. On RTX 20 and 30 the model runs in FP16 and costs roughly half your frame rate at full model resolution; lower the model resolution.
 5. Check reports what is installed and what the logs say. Removing deletes only the files listed in the tool's manifest, so a hand-made install is left alone and named as such.
 
@@ -100,7 +100,7 @@ The binary is `target\release\rtx-unlock.exe`. `cargo test` runs the unit tests.
 Nothing is bundled. Every component is downloaded at run time from its publisher, pinned to a commit and a SHA-256 where the publisher does not sign releases.
 
 - [sdli1995/dlssg_for_sm86](https://github.com/sdli1995/dlssg_for_sm86): the DLSS-G proxy with the embedded runtime, tag 0.3.5. SM75 route by Coldwood1026.
-- [ShaggyLorean/smooth-motion-rtx30-winmm](https://github.com/ShaggyLorean/smooth-motion-rtx30-winmm): the Smooth Motion proxy, release 0.2.0, built on [ReverieBizarre/Smooth-Motion-for-RTX30](https://github.com/ReverieBizarre/Smooth-Motion-for-RTX30).
+- [ShaggyLorean/smooth-motion-rtx30](https://github.com/ShaggyLorean/smooth-motion-rtx30): the Smooth Motion proxy, release 0.2.0, built on [ReverieBizarre/Smooth-Motion-for-RTX30](https://github.com/ReverieBizarre/Smooth-Motion-for-RTX30).
 - [Kizzuwatnaa/DLSS5-Autopilot](https://github.com/Kizzuwatnaa/DLSS5-Autopilot): MIT.
 - [praydog/REFramework](https://github.com/praydog/REFramework): nightly monolithic build.
 - ReShade by crosire and RenoDX by clshortfuse are downloaded by Autopilot from their publishers.
