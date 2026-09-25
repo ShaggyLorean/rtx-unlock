@@ -225,6 +225,7 @@ fn now_unix() -> u64 {
 pub fn slot_report(slots: &[ProxySlot]) -> Vec<String> {
     slots
         .iter()
+        .filter(|s| s.fits_fg())
         .map(|s| {
             let owner = s.owner.as_deref().map(|o| format!(", in folder: {o}")).unwrap_or_default();
             format!("{:12} {}{owner}: {}", s.name, s.load.label(), s.verdict())
@@ -277,6 +278,9 @@ pub fn install(
             return Err(format!("a hand-made dlssg_sm86 install exists ({}); remove it by hand first", p.display()))
         }
         FgStatus::NotInstalled => {}
+    }
+    if crate::sm::status(info).present() {
+        return Err("Smooth Motion is installed in this game; remove it first, one frame generator at a time".into());
     }
     for line in slot_report(&info.slots) {
         log(line);

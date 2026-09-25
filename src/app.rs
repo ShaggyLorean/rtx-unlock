@@ -10,6 +10,7 @@ use crate::fg::{self, FgStatus};
 use crate::game::{self, GameInfo};
 use crate::gpu::{self, Gpu, GpuClass};
 use crate::nr::{self, LogFacts, NrSettings};
+use crate::sm::{self, RunFacts, SmStatus};
 use crate::sources::Runtime;
 use crate::steam::{self, SteamGame};
 use crate::update::{self, Release};
@@ -35,6 +36,7 @@ impl Target {
 enum Msg {
     Log(String),
     Analyzed(Box<Result<GameInfo, String>>),
+    Refreshed(Box<GameInfo>),
     Done,
 }
 
@@ -60,7 +62,7 @@ enum Op {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Action {
-    Apply { fg: Op, dlss5: Op },
+    Apply { fg: Op, sm: Op, dlss5: Op },
     Check,
 }
 
@@ -79,6 +81,7 @@ pub struct App {
     info: Option<Result<GameInfo, String>>,
     gpu: Result<Gpu, String>,
     fg_tick: bool,
+    sm_tick: bool,
     dlss5_tick: bool,
     runtime: Runtime,
     max_frames: u32,
@@ -87,6 +90,8 @@ pub struct App {
     busy: bool,
     rx: Option<Receiver<Msg>>,
     fg_status: Option<FgStatus>,
+    sm_status: Option<SmStatus>,
+    sm_run: Option<RunFacts>,
     dlss5_status: Option<Dlss5State>,
     nr: Option<NrSettings>,
     nr_facts: Option<LogFacts>,
@@ -111,6 +116,7 @@ impl App {
             info: None,
             gpu,
             fg_tick: false,
+            sm_tick: false,
             dlss5_tick: false,
             runtime: Runtime::Dlssg3109,
             max_frames: 3,
@@ -119,6 +125,8 @@ impl App {
             busy: false,
             rx: None,
             fg_status: None,
+            sm_status: None,
+            sm_run: None,
             dlss5_status: None,
             nr: None,
             nr_facts: None,
@@ -217,11 +225,47 @@ impl App {
             GpuClass::NativeFg => return Err("RTX 40/50 already run DLSS Frame Generation".into()),
             GpuClass::Unsupported => return Err("unsupported GPU".into()),
         }
+        if self.sm_status.as_ref().is_some_and(|s| s.present()) {
+            return Err("Smooth Motion is installed; one frame generator at a time".into());
+        }
         match &self.info {
             Some(Ok(i)) if i.dlssg => Ok(()),
-            Some(Ok(_)) => Err("the game ships no DLSS-G DLL, nothing to unlock".into()),
+            Some(Ok(_)) => Err("the game ships no DLSS-G DLL, nothing to unlock; Smooth Motion works without it".into()),
             Some(Err(e)) => Err(e.clone()),
             None => Err("no game selected".into()),
+        }
+    }
+
+    fn sm_install_allowed(&self) -> Result<(), String> {
+        let gpu = self.gpu.as_ref().map_err(|e| e.clone())?;
+        if let Some(e) = sm::gpu_block(gpu) {
+            return Err(e);
+        }
+        if matches!(self.fg_status, Some(FgStatus::Installed(_)) | Some(FgStatus::Manual(_))) {
+            return Err("the DLSS-G FG unlock is installed; one frame generator at a time".into());
+        }
+        match &self.info {
+            Some(Ok(i)) => match sm::choose_proxy(&i.slots) {
+                Some(_) => Ok(()),
+                None => Err(sm::no_proxy_message(&i.slots)),
+            },
+            Some(Err(e)) => Err(e.clone()),
+            None => Err("no game selected".into()),
+        }
+    }
+
+    fn sm_row(&self) -> Row {
+        match &self.sm_status {
+            Some(SmStatus::Installed(_)) => Row { op_if_ticked: Op::Remove, enabled: true, reason: None },
+            Some(SmStatus::Manual(_)) => Row {
+                op_if_ticked: Op::Keep,
+                enabled: false,
+                reason: Some("installed by hand, remove it by hand".into()),
+            },
+            _ => match self.sm_install_allowed() {
+                Ok(()) => Row { op_if_ticked: Op::Install, enabled: true, reason: None },
+                Err(e) => Row { op_if_ticked: Op::Keep, enabled: false, reason: Some(e) },
+            },
         }
     }
 
@@ -279,6 +323,8 @@ impl App {
         self.selected = Some(target.clone());
         self.info = None;
         self.fg_status = None;
+        self.sm_status = None;
+        self.sm_run = None;
         self.dlss5_status = None;
         self.nr = None;
         self.nr_facts = None;
@@ -303,6 +349,8 @@ impl App {
     fn refresh_status(&mut self) {
         if let Some(Ok(i)) = &self.info {
             self.fg_status = Some(fg::status(i));
+            self.sm_status = Some(sm::status(i));
+            self.sm_run = sm::read_last_run(&i.proxy_dir);
             self.dlss5_status = dlss5::status(&i.proxy_dir);
             self.nr = if self.dlss5_status.is_some() {
                 Some(nr::load(&i.proxy_dir).unwrap_or_default())
@@ -313,8 +361,10 @@ impl App {
             self.nr_dirty = false;
         }
         let fg = self.fg_row();
+        let smr = self.sm_row();
         let d5 = self.dlss5_row();
         self.fg_tick = fg.enabled && fg.op_if_ticked == Op::Install;
+        self.sm_tick = !self.fg_tick && smr.enabled && smr.op_if_ticked == Op::Install;
         self.dlss5_tick = d5.enabled && d5.op_if_ticked == Op::Install;
     }
 
@@ -372,7 +422,7 @@ impl App {
     }
 
     fn start(&mut self, action: Action) {
-        let Some(Ok(info)) = self.info.clone() else { return };
+        let Some(Ok(mut info)) = self.info.clone() else { return };
         let gpu = self.gpu.clone();
         let runtime = self.runtime;
         let max_frames = self.max_frames;
@@ -393,17 +443,40 @@ impl App {
                 }
             };
             match action {
-                Action::Apply { fg: fg_op, dlss5: d5_op } => {
+                Action::Apply { fg: fg_op, sm: sm_op, dlss5: d5_op } => {
                     let mut ok = true;
+                    let refresh = |info: &mut GameInfo| {
+                        if let Ok(i) = game::reanalyze(info) {
+                            *info = i;
+                        }
+                    };
                     match fg_op {
-                        Op::Install => match &gpu {
-                            Ok(g) => ok = step("FG unlock", fg::install(&info, g, runtime, max_frames, &log)),
-                            Err(e) => ok = step("FG unlock", Err(e.clone())),
-                        },
                         Op::Remove => {
                             step("FG unlock", fg::remove(&info, &log));
+                            refresh(&mut info);
                         }
-                        Op::Keep => {}
+                        Op::Install | Op::Keep => {}
+                    }
+                    match sm_op {
+                        Op::Remove => {
+                            step("Smooth Motion", sm::remove(&info, &log));
+                            refresh(&mut info);
+                        }
+                        Op::Install | Op::Keep => {}
+                    }
+                    if fg_op == Op::Install {
+                        match &gpu {
+                            Ok(g) => ok = step("FG unlock", fg::install(&info, g, runtime, max_frames, &log)),
+                            Err(e) => ok = step("FG unlock", Err(e.clone())),
+                        }
+                        refresh(&mut info);
+                    }
+                    if sm_op == Op::Install {
+                        match &gpu {
+                            Ok(g) => ok = step("Smooth Motion", sm::install(&info, g, &log)) && ok,
+                            Err(e) => ok = step("Smooth Motion", Err(e.clone())),
+                        }
+                        refresh(&mut info);
                     }
                     match d5_op {
                         Op::Install if ok => {
@@ -420,7 +493,7 @@ impl App {
                                 }
                             }
                         }
-                        Op::Install => log("DLSS 5 skipped because the FG unlock failed".into()),
+                        Op::Install => log("DLSS 5 skipped because a frame generation step failed".into()),
                         Op::Remove => {
                             let r = dlss5::ensure_autopilot(&log)
                                 .and_then(|exe| dlss5::remove(&exe, &info.root, &log));
@@ -428,12 +501,22 @@ impl App {
                         }
                         Op::Keep => {}
                     }
-                    if fg_op == Op::Keep && d5_op == Op::Keep {
+                    if fg_op == Op::Keep && sm_op == Op::Keep && d5_op == Op::Keep {
                         log("nothing ticked".into());
                     }
+                    refresh(&mut info);
+                    let _ = tx.send(Msg::Refreshed(Box::new(info.clone())));
                 }
                 Action::Check => {
                     log(format!("FG unlock: {}", fg::status(&info).label()));
+                    log(format!("Smooth Motion: {}", sm::status(&info).label()));
+                    match sm::read_last_run(&info.proxy_dir) {
+                        Some(r) => log(format!("Smooth Motion last run: {}", r.summary())),
+                        None if sm::status(&info).present() => {
+                            log("Smooth Motion: no proxy log yet, launch the game once".into())
+                        }
+                        None => {}
+                    }
                     match dlss5::status(&info.proxy_dir) {
                         Some(s) => {
                             log(format!("DLSS 5: {}", s.label()));
@@ -461,6 +544,7 @@ impl App {
                 match m {
                     Msg::Log(s) => logs.push(s),
                     Msg::Analyzed(r) => analyzed = Some(*r),
+                    Msg::Refreshed(i) => self.info = Some(Ok(*i)),
                     Msg::Done => done = true,
                 }
             }
@@ -616,235 +700,311 @@ impl eframe::App for App {
         let mut action: Option<Action> = None;
         let mut nr_save = false;
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("rtx-unlock");
-            match &self.gpu {
-                Ok(g) => {
-                    ui.label(format!("GPU: {} | driver {} | {}", g.name, g.driver, g.class.label()));
-                }
-                Err(e) => {
-                    ui.colored_label(egui::Color32::LIGHT_RED, e);
-                }
-            }
-            ui.separator();
-
-            match &self.info {
-                None => {
-                    ui.label(if self.busy { "Inspecting the game..." } else { "Pick a game on the left." });
-                }
-                Some(Err(e)) => {
-                    ui.colored_label(egui::Color32::LIGHT_RED, format!("Cannot inspect this folder: {e}"));
-                    ui.label("Choose the folder that holds the game's own executable and try again.");
-                }
-                Some(Ok(i)) => {
-                    ui.label(format!("exe: {}", i.exe.display()));
-                    ui.label(format!("engine: {}", i.engine.label()));
-                    ui.label(format!(
-                        "DLSS-G DLL: {}",
-                        if i.dlssg { "present" } else { "missing (the game has no DLSS Frame Generation of its own)" }
-                    ));
-                    if let Some(ac) = i.anticheat {
-                        ui.colored_label(
-                            egui::Color32::LIGHT_RED,
-                            format!("{ac} is present. It can refuse to start the game with a proxy DLL in place, and online play with one can get the account banned."),
-                        );
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ui.heading("rtx-unlock");
+                match &self.gpu {
+                    Ok(g) => {
+                        ui.label(format!("GPU: {} | driver {} | {}", g.name, g.driver, g.class.label()));
                     }
-                    ui.add_space(4.0);
-                    ui.label("Proxy names this executable can load:");
-                    let chosen = fg::choose_proxy(&i.slots, self.runtime);
-                    egui::Grid::new("proxies").striped(true).spacing([16.0, 2.0]).show(ui, |ui| {
-                        ui.strong("name");
-                        ui.strong("how the game loads it");
-                        ui.strong("in the folder");
-                        ui.strong("verdict");
-                        ui.end_row();
-                        for s in &i.slots {
-                            ui.monospace(s.name);
-                            ui.label(s.load.label());
-                            ui.label(s.owner.as_deref().unwrap_or("free"));
-                            let v = s.verdict();
-                            if chosen == Some(s.name) {
-                                ui.colored_label(egui::Color32::LIGHT_GREEN, format!("{v}, chosen"));
-                            } else if s.usable() {
-                                ui.label(v);
-                            } else {
-                                ui.colored_label(egui::Color32::GRAY, v);
-                            }
+                    Err(e) => {
+                        ui.colored_label(egui::Color32::LIGHT_RED, e);
+                    }
+                }
+                ui.separator();
+
+                match &self.info {
+                    None => {
+                        ui.label(if self.busy { "Inspecting the game..." } else { "Pick a game on the left." });
+                    }
+                    Some(Err(e)) => {
+                        ui.colored_label(egui::Color32::LIGHT_RED, format!("Cannot inspect this folder: {e}"));
+                        ui.label("Choose the folder that holds the game's own executable and try again.");
+                    }
+                    Some(Ok(i)) => {
+                        ui.label(format!("exe: {}", i.exe.display()));
+                        ui.label(format!("engine: {}", i.engine.label()));
+                        ui.label(format!(
+                            "DLSS-G DLL: {}",
+                            if i.dlssg { "present" } else { "missing (the game has no DLSS Frame Generation of its own)" }
+                        ));
+                        if let Some(ac) = i.anticheat {
+                            ui.colored_label(
+                                egui::Color32::LIGHT_RED,
+                                format!("{ac} is present. It can refuse to start the game with a proxy DLL in place, and online play with one can get the account banned."),
+                            );
+                        }
+                        let fg_row = self.fg_row();
+                        let sm_row = self.sm_row();
+                        let d5_row = self.dlss5_row();
+                        let fg_pick = (fg_row.enabled && fg_row.op_if_ticked == Op::Install)
+                            .then(|| fg::choose_proxy(&i.slots, self.runtime))
+                            .flatten();
+                        let sm_pick = sm::choose_proxy(&i.slots);
+                        let sm_marker = (sm_row.enabled && sm_row.op_if_ticked == Op::Install).then_some(sm_pick).flatten();
+                        ui.add_space(4.0);
+                        ui.label("Proxy names this executable loads:");
+                        egui::Grid::new("proxies").striped(true).spacing([16.0, 2.0]).show(ui, |ui| {
+                            ui.strong("name");
+                            ui.strong("how the game loads it");
+                            ui.strong("in the folder");
+                            ui.strong("fits");
+                            ui.strong("verdict");
                             ui.end_row();
-                        }
-                    });
-                    let others: Vec<String> = i
-                        .present
-                        .iter()
-                        .filter(|(n, _)| !i.slots.iter().any(|s| s.name == n))
-                        .map(|(n, o)| format!("{n} ({o})"))
-                        .collect();
-                    if !others.is_empty() {
-                        ui.label(format!("other proxies in the folder: {}", others.join(", ")));
-                    }
-                    if let Some(f) = &self.nr_facts {
-                        if let Some(d) = &f.device_lost {
-                            ui.colored_label(egui::Color32::LIGHT_RED, format!("GPU device lost in the last session: {d}"));
-                        }
-                    }
-                    ui.separator();
-
-                    let fg_row = self.fg_row();
-                    let d5_row = self.dlss5_row();
-                    let fg_status = self.fg_status.as_ref().map(|s| s.label()).unwrap_or_default();
-                    let d5_status = self.dlss5_status.as_ref().map(|s| s.label()).unwrap_or("not installed".into());
-
-                    Self::component_row(ui, "Frame Generation unlock", &fg_status, &fg_row, &mut self.fg_tick);
-                    if self.fg_tick && fg_row.op_if_ticked == Op::Install {
-                        ui.horizontal(|ui| {
-                            ui.add_space(40.0);
-                            ui.label("build:");
-                            egui::ComboBox::from_id_salt("runtime")
-                                .selected_text(self.runtime.label())
-                                .show_ui(ui, |ui| {
-                                    for r in Runtime::ALL {
-                                        ui.selectable_value(&mut self.runtime, r, r.label());
-                                    }
+                            for s in i.slots.iter().filter(|s| s.load != game::Load::Never || s.owner.is_some()) {
+                                ui.monospace(s.name);
+                                ui.label(s.load.label());
+                                ui.label(s.owner.as_deref().unwrap_or("free"));
+                                ui.label(match (s.fits_fg(), s.fits_sm()) {
+                                    (true, true) => "FG, Smooth Motion",
+                                    (true, false) => "FG",
+                                    (false, true) => "Smooth Motion",
+                                    (false, false) => "",
                                 });
-                            let ceiling = self.runtime.max_generated_frames();
-                            if self.max_frames > ceiling {
-                                self.max_frames = ceiling;
-                            }
-                            ui.label("up to:");
-                            egui::ComboBox::from_id_salt("frames")
-                                .selected_text(format!("{}X", self.max_frames + 1))
-                                .show_ui(ui, |ui| {
-                                    for n in 1..=ceiling {
-                                        ui.selectable_value(&mut self.max_frames, n, format!("{}X", n + 1));
-                                    }
-                                });
-                        });
-                        if fg::choose_proxy(&i.slots, self.runtime).is_none() {
-                            ui.horizontal(|ui| {
-                                ui.add_space(40.0);
-                                ui.colored_label(egui::Color32::YELLOW, fg::no_proxy_message(&i.slots, self.runtime));
-                            });
-                        }
-                    }
-                    ui.add_space(6.0);
-                    Self::component_row(ui, "DLSS 5 neural rendering", &d5_status, &d5_row, &mut self.dlss5_tick);
-                    if self.dlss5_tick && d5_row.op_if_ticked == Op::Install {
-                        ui.horizontal(|ui| {
-                            ui.add_space(40.0);
-                            ui.label("route:");
-                            egui::ComboBox::from_id_salt("route")
-                                .selected_text(&self.route)
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut self.route, "native".into(), "native");
-                                    ui.selectable_value(&mut self.route, "upstream".into(), "upstream");
-                                });
-                        });
-                    }
-                    ui.add_space(8.0);
-
-                    let fg_op = if self.fg_tick && fg_row.enabled { fg_row.op_if_ticked } else { Op::Keep };
-                    let d5_op = if self.dlss5_tick && d5_row.enabled { d5_row.op_if_ticked } else { Op::Keep };
-                    let installs = [fg_op, d5_op].iter().filter(|o| **o == Op::Install).count();
-                    let removes = [fg_op, d5_op].iter().filter(|o| **o == Op::Remove).count();
-                    let apply_label = match (installs, removes) {
-                        (0, 0) => "Nothing ticked".to_string(),
-                        (n, 0) => format!("Install {n}"),
-                        (0, n) => format!("Remove {n}"),
-                        (a, b) => format!("Install {a}, remove {b}"),
-                    };
-                    ui.horizontal(|ui| {
-                        let can_apply = !self.busy && (installs + removes) > 0;
-                        if ui.add_enabled(can_apply, egui::Button::new(&apply_label)).clicked() {
-                            action = Some(Action::Apply { fg: fg_op, dlss5: d5_op });
-                        }
-                        if ui.add_enabled(!self.busy, egui::Button::new("Check")).clicked() {
-                            action = Some(Action::Check);
-                        }
-                        if self.busy {
-                            ui.spinner();
-                            ui.label("working...");
-                        }
-                    });
-                    if removes > 0 {
-                        ui.colored_label(egui::Color32::GRAY, "Remove deletes only the files listed in this tool's manifest.");
-                    }
-                    ui.separator();
-
-                    if let Some(s) = &mut self.nr {
-                        let hdr = self.nr_facts.as_ref().map_or(false, |f| f.hdr_codec);
-                        ui.collapsing("DLSS 5 NR settings (ReShade.ini)", |ui| {
-                            let mut changed = false;
-                            changed |= ui.checkbox(&mut s.enabled, "neural rendering enabled").changed();
-                            ui.horizontal(|ui| {
-                                ui.label("style:");
-                                egui::ComboBox::from_id_salt("nr_style")
-                                    .selected_text(nr::STYLE_NAMES.get(s.style as usize).copied().unwrap_or("?"))
-                                    .show_ui(ui, |ui| {
-                                        for (i, n) in nr::STYLE_NAMES.iter().enumerate() {
-                                            changed |= ui.selectable_value(&mut s.style, i as i32, *n).changed();
-                                        }
-                                    });
-                                ui.label("preset:");
-                                egui::ComboBox::from_id_salt("nr_preset")
-                                    .selected_text(nr::PRESET_NAMES.get(s.preset as usize).copied().unwrap_or("?"))
-                                    .show_ui(ui, |ui| {
-                                        for (i, n) in nr::PRESET_NAMES.iter().enumerate() {
-                                            changed |= ui.selectable_value(&mut s.preset, i as i32, *n).changed();
-                                        }
-                                    });
-                            });
-                            changed |= ui.add(egui::Slider::new(&mut s.intensity, 0.0..=1.0).text("intensity")).changed();
-                            changed |= ui.add(egui::Slider::new(&mut s.local_tone, 0.0..=1.0).text("local tone")).changed();
-                            changed |= ui.add(egui::Slider::new(&mut s.local_structure, 0.0..=1.0).text("local structure")).changed();
-                            changed |= ui.add(egui::Slider::new(&mut s.skin_structure, -1.0..=1.0).text("skin structure (-1 = follow local)")).changed();
-                            changed |= ui.add(egui::Slider::new(&mut s.paper_white, 1.0..=64.0).logarithmic(true).text("paper-white (scene-linear HDR)")).changed();
-                            ui.horizontal(|ui| {
-                                changed |= ui.checkbox(&mut s.auto_mask, "automatic skin mask").changed();
-                                changed |= ui.checkbox(&mut s.ui_correction, "UI correction").changed();
-                            });
-                            if hdr && s.paper_white <= 1.0 {
-                                ui.colored_label(
-                                    egui::Color32::YELLOW,
-                                    format!("This game hands DLSS a pre-tonemap linear buffer; paper-white 1 gives a grey frame. Start at {}.", nr::RE_ENGINE_PAPER_WHITE),
-                                );
-                            } else if hdr {
-                                ui.colored_label(egui::Color32::GRAY, "HDR codec active: tune paper-white between 8 and 32 to the scene exposure; lower for dark scenes, higher for bright ones.");
-                            }
-                            if changed {
-                                self.nr_dirty = true;
-                            }
-                            ui.horizontal(|ui| {
-                                let can_save = self.nr_dirty && !self.busy;
-                                if ui.add_enabled(can_save, egui::Button::new("Save NR settings")).clicked() {
-                                    nr_save = true;
+                                let v = s.verdict();
+                                let mut picks = Vec::new();
+                                if fg_pick == Some(s.name) {
+                                    picks.push("FG");
                                 }
-                                ui.colored_label(egui::Color32::GRAY, "save while the game is closed");
-                            });
+                                if sm_marker == Some(s.name) {
+                                    picks.push("Smooth Motion");
+                                }
+                                if !picks.is_empty() {
+                                    ui.colored_label(egui::Color32::LIGHT_GREEN, format!("chosen for {}", picks.join(" or ")));
+                                } else if s.usable() {
+                                    ui.label(v);
+                                } else {
+                                    ui.colored_label(egui::Color32::GRAY, v);
+                                }
+                                ui.end_row();
+                            }
                         });
+                        let hidden: Vec<&str> = i
+                            .slots
+                            .iter()
+                            .filter(|s| s.load == game::Load::Never && s.owner.is_none())
+                            .map(|s| s.name)
+                            .collect();
+                        if !hidden.is_empty() {
+                            ui.colored_label(egui::Color32::GRAY, format!("not loaded by this executable: {}", hidden.join(", ")));
+                        }
+                        let others: Vec<String> = i
+                            .present
+                            .iter()
+                            .filter(|(n, _)| !i.slots.iter().any(|s| s.name == n))
+                            .map(|(n, o)| format!("{n} ({o})"))
+                            .collect();
+                        if !others.is_empty() {
+                            ui.label(format!("other proxies in the folder: {}", others.join(", ")));
+                        }
                         if let Some(f) = &self.nr_facts {
-                            if let Some(d) = &f.driver {
-                                if nr::driver_faults_new_addon(d) {
-                                    ui.colored_label(
-                                        egui::Color32::GRAY,
-                                        format!("driver {d}: add-on 4.55 (manual paper-white). The 4.7 build with the automatic colour bridge only runs on driver 616.56."),
-                                    );
-                                }
+                            if let Some(d) = &f.device_lost {
+                                ui.colored_label(egui::Color32::LIGHT_RED, format!("GPU device lost in the last session: {d}"));
                             }
                         }
                         ui.separator();
-                    }
 
-                    ui.colored_label(
-                        egui::Color32::GRAY,
-                        "Online games with anti-cheat can ban for this. Antivirus may quarantine the DLLs; exclude the game folder.",
-                    );
-                    if i.engine == game::Engine::ReEngine {
+                        let fg_status = self.fg_status.as_ref().map(|s| s.label()).unwrap_or_default();
+                        let sm_status = self.sm_status.as_ref().map(|s| s.label()).unwrap_or_default();
+                        let d5_status = self.dlss5_status.as_ref().map(|s| s.label()).unwrap_or("not installed".into());
+
+                        let fg_changed = Self::component_row(ui, "Frame Generation unlock (DLSS-G)", &fg_status, &fg_row, &mut self.fg_tick);
+                        if self.fg_tick && fg_row.op_if_ticked == Op::Install {
+                            ui.horizontal(|ui| {
+                                ui.add_space(40.0);
+                                ui.label("build:");
+                                egui::ComboBox::from_id_salt("runtime")
+                                    .selected_text(self.runtime.label())
+                                    .show_ui(ui, |ui| {
+                                        for r in Runtime::ALL {
+                                            ui.selectable_value(&mut self.runtime, r, r.label());
+                                        }
+                                    });
+                                let ceiling = self.runtime.max_generated_frames();
+                                if self.max_frames > ceiling {
+                                    self.max_frames = ceiling;
+                                }
+                                ui.label("up to:");
+                                egui::ComboBox::from_id_salt("frames")
+                                    .selected_text(format!("{}X", self.max_frames + 1))
+                                    .show_ui(ui, |ui| {
+                                        for n in 1..=ceiling {
+                                            ui.selectable_value(&mut self.max_frames, n, format!("{}X", n + 1));
+                                        }
+                                    });
+                            });
+                            if fg::choose_proxy(&i.slots, self.runtime).is_none() {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(40.0);
+                                    ui.colored_label(egui::Color32::YELLOW, fg::no_proxy_message(&i.slots, self.runtime));
+                                });
+                            }
+                        }
+                        ui.add_space(6.0);
+                        let sm_changed = Self::component_row(ui, "Smooth Motion", &sm_status, &sm_row, &mut self.sm_tick);
+                        if self.sm_tick && sm_row.op_if_ticked == Op::Install {
+                            if let Some(p) = sm_pick {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(40.0);
+                                    ui.label(format!(
+                                        "installs as {p}, build {} from {}",
+                                        crate::sources::SM_VERSION,
+                                        crate::sources::SM_REPO
+                                    ));
+                                });
+                            }
+                            if i.dlssg {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(40.0);
+                                    ui.colored_label(egui::Color32::GRAY, "this game ships DLSS-G; the FG unlock above is the better choice here");
+                                });
+                            }
+                            if let Some(n) = self.gpu.as_ref().ok().and_then(sm::driver_note) {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(40.0);
+                                    ui.colored_label(egui::Color32::YELLOW, n);
+                                });
+                            }
+                        }
+                        if self.sm_status.as_ref().is_some_and(|s| s.present()) {
+                            if let Some(r) = &self.sm_run {
+                                let working = r.wrapped && r.graphs > 0;
+                                ui.horizontal(|ui| {
+                                    ui.add_space(16.0);
+                                    ui.colored_label(
+                                        if working { egui::Color32::LIGHT_GREEN } else { egui::Color32::YELLOW },
+                                        format!("last run: {}", r.summary()),
+                                    );
+                                });
+                            }
+                        }
+                        if fg_changed && self.fg_tick && fg_row.op_if_ticked == Op::Install && sm_row.op_if_ticked == Op::Install {
+                            self.sm_tick = false;
+                        }
+                        if sm_changed && self.sm_tick && sm_row.op_if_ticked == Op::Install && fg_row.op_if_ticked == Op::Install {
+                            self.fg_tick = false;
+                        }
+                        ui.add_space(6.0);
+                        Self::component_row(ui, "DLSS 5 neural rendering", &d5_status, &d5_row, &mut self.dlss5_tick);
+                        if self.dlss5_tick && d5_row.op_if_ticked == Op::Install {
+                            ui.horizontal(|ui| {
+                                ui.add_space(40.0);
+                                ui.label("route:");
+                                egui::ComboBox::from_id_salt("route")
+                                    .selected_text(&self.route)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut self.route, "native".into(), "native");
+                                        ui.selectable_value(&mut self.route, "upstream".into(), "upstream");
+                                    });
+                            });
+                        }
+                        ui.add_space(8.0);
+
+                        let fg_op = if self.fg_tick && fg_row.enabled { fg_row.op_if_ticked } else { Op::Keep };
+                        let sm_op = if self.sm_tick && sm_row.enabled { sm_row.op_if_ticked } else { Op::Keep };
+                        let d5_op = if self.dlss5_tick && d5_row.enabled { d5_row.op_if_ticked } else { Op::Keep };
+                        let installs = [fg_op, sm_op, d5_op].iter().filter(|o| **o == Op::Install).count();
+                        let removes = [fg_op, sm_op, d5_op].iter().filter(|o| **o == Op::Remove).count();
+                        let apply_label = match (installs, removes) {
+                            (0, 0) => "Nothing ticked".to_string(),
+                            (n, 0) => format!("Install {n}"),
+                            (0, n) => format!("Remove {n}"),
+                            (a, b) => format!("Install {a}, remove {b}"),
+                        };
+                        ui.horizontal(|ui| {
+                            let can_apply = !self.busy && (installs + removes) > 0;
+                            if ui.add_enabled(can_apply, egui::Button::new(&apply_label)).clicked() {
+                                action = Some(Action::Apply { fg: fg_op, sm: sm_op, dlss5: d5_op });
+                            }
+                            if ui.add_enabled(!self.busy, egui::Button::new("Check")).clicked() {
+                                action = Some(Action::Check);
+                            }
+                            if self.busy {
+                                ui.spinner();
+                                ui.label("working...");
+                            }
+                        });
+                        if removes > 0 {
+                            ui.colored_label(egui::Color32::GRAY, "Remove deletes only the files listed in this tool's manifest.");
+                        }
+                        ui.separator();
+
+                        if let Some(s) = &mut self.nr {
+                            let hdr = self.nr_facts.as_ref().map_or(false, |f| f.hdr_codec);
+                            ui.collapsing("DLSS 5 NR settings (ReShade.ini)", |ui| {
+                                let mut changed = false;
+                                changed |= ui.checkbox(&mut s.enabled, "neural rendering enabled").changed();
+                                ui.horizontal(|ui| {
+                                    ui.label("style:");
+                                    egui::ComboBox::from_id_salt("nr_style")
+                                        .selected_text(nr::STYLE_NAMES.get(s.style as usize).copied().unwrap_or("?"))
+                                        .show_ui(ui, |ui| {
+                                            for (i, n) in nr::STYLE_NAMES.iter().enumerate() {
+                                                changed |= ui.selectable_value(&mut s.style, i as i32, *n).changed();
+                                            }
+                                        });
+                                    ui.label("preset:");
+                                    egui::ComboBox::from_id_salt("nr_preset")
+                                        .selected_text(nr::PRESET_NAMES.get(s.preset as usize).copied().unwrap_or("?"))
+                                        .show_ui(ui, |ui| {
+                                            for (i, n) in nr::PRESET_NAMES.iter().enumerate() {
+                                                changed |= ui.selectable_value(&mut s.preset, i as i32, *n).changed();
+                                            }
+                                        });
+                                });
+                                changed |= ui.add(egui::Slider::new(&mut s.intensity, 0.0..=1.0).text("intensity")).changed();
+                                changed |= ui.add(egui::Slider::new(&mut s.local_tone, 0.0..=1.0).text("local tone")).changed();
+                                changed |= ui.add(egui::Slider::new(&mut s.local_structure, 0.0..=1.0).text("local structure")).changed();
+                                changed |= ui.add(egui::Slider::new(&mut s.skin_structure, -1.0..=1.0).text("skin structure (-1 = follow local)")).changed();
+                                changed |= ui.add(egui::Slider::new(&mut s.paper_white, 1.0..=64.0).logarithmic(true).text("paper-white (scene-linear HDR)")).changed();
+                                ui.horizontal(|ui| {
+                                    changed |= ui.checkbox(&mut s.auto_mask, "automatic skin mask").changed();
+                                    changed |= ui.checkbox(&mut s.ui_correction, "UI correction").changed();
+                                });
+                                if hdr && s.paper_white <= 1.0 {
+                                    ui.colored_label(
+                                        egui::Color32::YELLOW,
+                                        format!("This game hands DLSS a pre-tonemap linear buffer; paper-white 1 gives a grey frame. Start at {}.", nr::RE_ENGINE_PAPER_WHITE),
+                                    );
+                                } else if hdr {
+                                    ui.colored_label(egui::Color32::GRAY, "HDR codec active: tune paper-white between 8 and 32 to the scene exposure; lower for dark scenes, higher for bright ones.");
+                                }
+                                if changed {
+                                    self.nr_dirty = true;
+                                }
+                                ui.horizontal(|ui| {
+                                    let can_save = self.nr_dirty && !self.busy;
+                                    if ui.add_enabled(can_save, egui::Button::new("Save NR settings")).clicked() {
+                                        nr_save = true;
+                                    }
+                                    ui.colored_label(egui::Color32::GRAY, "save while the game is closed");
+                                });
+                            });
+                            if let Some(f) = &self.nr_facts {
+                                if let Some(d) = &f.driver {
+                                    if nr::driver_faults_new_addon(d) {
+                                        ui.colored_label(
+                                            egui::Color32::GRAY,
+                                            format!("driver {d}: add-on 4.55 (manual paper-white). The 4.7 build with the automatic colour bridge only runs on driver 616.56."),
+                                        );
+                                    }
+                                }
+                            }
+                            ui.separator();
+                        }
+
                         ui.colored_label(
                             egui::Color32::GRAY,
-                            "RE Engine: when no proxy name is free, the FG unlock goes into reframework\\plugins; the nightly REFramework dinput8.dll is installed if it is missing.",
+                            "Online games with anti-cheat can ban for this. Antivirus may quarantine the DLLs; exclude the game folder.",
                         );
+                        if i.engine == game::Engine::ReEngine {
+                            ui.colored_label(
+                                egui::Color32::GRAY,
+                                "RE Engine: when no proxy name is free, the FG unlock goes into reframework\\plugins; the nightly REFramework dinput8.dll is installed if it is missing.",
+                            );
+                        }
                     }
                 }
-            }
+            });
         });
 
         if do_update {

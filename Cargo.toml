@@ -1,6 +1,6 @@
 [package]
 name = "rtx-unlock"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "DLSS Frame Generation unlock and DLSS 5 neural rendering for RTX 20 and 30 series, in one executable"
 
@@ -10,6 +10,7 @@ goblin = { version = "0.10", default-features = false, features = ["pe64", "pe32
 ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
 zip = { version = "4", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
+memchr = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rfd = "0.15"

@@ -8,6 +8,7 @@ mod fg;
 mod game;
 mod gpu;
 mod nr;
+mod sm;
 mod sources;
 mod steam;
 mod update;

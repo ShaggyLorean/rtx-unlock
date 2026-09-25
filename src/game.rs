@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::sources::{ALL_PROXIES, PROXY_FAMILY};
+use crate::sources::{is_sm_hash, FG_PROXIES, PROXY_FAMILY, SM_PROXIES, TABLE_PROXIES};
 use crate::winutil::original_filename;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,18 +65,30 @@ impl ProxySlot {
         PROXY_FAMILY.contains(&self.name)
     }
 
+    pub fn render_path(&self) -> bool {
+        matches!(self.name, "dxgi.dll" | "d3d12.dll")
+    }
+
+    pub fn fits_fg(&self) -> bool {
+        FG_PROXIES.contains(&self.name)
+    }
+
+    pub fn fits_sm(&self) -> bool {
+        SM_PROXIES.contains(&self.name)
+    }
+
     pub fn verdict(&self) -> String {
         if self.known_dll {
-            return "Windows KnownDLL, the system copy always wins".into();
+            return "KnownDLL, system copy wins".into();
         }
         if let Some(o) = &self.owner {
             return format!("taken by {o}");
         }
         match self.load {
-            Load::Import if self.is_family() => "usable".into(),
+            Load::Import if !self.render_path() => "usable".into(),
             Load::Import => "usable, render path".into(),
             Load::DelayLoad => "usable, may load too late".into(),
-            Load::Reference => "unclear, not chosen automatically".into(),
+            Load::Reference => "unclear, never picked".into(),
             Load::Never => "never loaded".into(),
         }
     }
@@ -111,16 +123,20 @@ pub fn detect_anticheat(root: &Path) -> Option<&'static str> {
     None
 }
 
-pub const PROXY_NAMES: [&str; 10] = [
+pub const PROXY_NAMES: [&str; 14] = [
     "version.dll",
     "winmm.dll",
     "dbghelp.dll",
     "dinput8.dll",
     "dxgi.dll",
     "d3d12.dll",
+    "d3d11.dll",
+    "dsound.dll",
+    "hid.dll",
     "winhttp.dll",
-    "dwmapi.dll",
     "wininet.dll",
+    "dwmapi.dll",
+    "xinput1_4.dll",
     "xinput1_3.dll",
 ];
 
@@ -247,22 +263,18 @@ fn delay_loaded(data: &[u8], pe: &goblin::pe::PE) -> Vec<String> {
     out
 }
 
-fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || hay.len() < needle.len() {
-        return false;
-    }
-    hay.windows(needle.len())
-        .any(|w| w.iter().zip(needle).all(|(a, b)| a.eq_ignore_ascii_case(b)))
-}
-
 fn utf16(s: &str) -> Vec<u8> {
     s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
 }
 
 fn referenced_names(data: &[u8], names: &[&str]) -> Vec<String> {
+    let lower = data.to_ascii_lowercase();
     names
         .iter()
-        .filter(|n| contains_ci(data, n.as_bytes()) || contains_ci(data, &utf16(n)))
+        .filter(|n| {
+            let n = n.to_ascii_lowercase();
+            memchr::memmem::find(&lower, n.as_bytes()).is_some() || memchr::memmem::find(&lower, &utf16(&n)).is_some()
+        })
         .map(|n| n.to_string())
         .collect()
 }
@@ -280,7 +292,7 @@ pub fn exe_loads(exe: &Path) -> Result<ExeLoads, String> {
     imports.sort();
     imports.dedup();
     let delay = delay_loaded(&data, &pe);
-    let references = referenced_names(&data, &ALL_PROXIES);
+    let references = referenced_names(&data, &TABLE_PROXIES);
     Ok(ExeLoads { imports, delay, references })
 }
 
@@ -303,7 +315,7 @@ pub fn known_dlls() -> Vec<String> {
 
 pub fn proxy_slots(loads: &ExeLoads, proxy_dir: &Path, known: &[String]) -> Vec<ProxySlot> {
     let has_ini = proxy_dir.join("dlssg_sm86.ini").exists();
-    ALL_PROXIES
+    TABLE_PROXIES
         .iter()
         .map(|&name| {
             let has = |v: &[String]| v.iter().any(|x| x.eq_ignore_ascii_case(name));
@@ -317,9 +329,7 @@ pub fn proxy_slots(loads: &ExeLoads, proxy_dir: &Path, known: &[String]) -> Vec<
                 Load::Never
             };
             let path = proxy_dir.join(name);
-            let owner = path
-                .is_file()
-                .then(|| label_for(original_filename(&path).as_deref(), has_ini));
+            let owner = path.is_file().then(|| identify(&path, has_ini));
             ProxySlot { name, load, known_dll: has(known), owner }
         })
         .collect()
@@ -354,17 +364,28 @@ pub fn label_for(original: Option<&str>, has_sm86_ini: bool) -> String {
     }
 }
 
+pub const SM_LABEL: &str = "Smooth Motion";
+
+pub fn identify(path: &Path, has_sm86_ini: bool) -> String {
+    const SMALL: u64 = 8 << 20;
+    let orig = original_filename(path);
+    if orig.is_none() && fs::metadata(path).map(|m| m.len() < SMALL).unwrap_or(false) {
+        if let Ok(bytes) = fs::read(path) {
+            if is_sm_hash(&crate::download::sha256_hex(&bytes)) {
+                return SM_LABEL.into();
+            }
+        }
+    }
+    label_for(orig.as_deref(), has_sm86_ini)
+}
+
 pub fn present_proxies(proxy_dir: &Path) -> Vec<(String, String)> {
     let has_ini = proxy_dir.join("dlssg_sm86.ini").exists();
     PROXY_NAMES
         .iter()
         .filter_map(|n| {
             let p = proxy_dir.join(n);
-            if !p.is_file() {
-                return None;
-            }
-            let orig = original_filename(&p);
-            Some((n.to_string(), label_for(orig.as_deref(), has_ini)))
+            p.is_file().then(|| (n.to_string(), identify(&p, has_ini)))
         })
         .collect()
 }
@@ -394,6 +415,10 @@ pub fn analyze_exe(exe: &Path) -> Result<GameInfo, String> {
     }
     let root = root_for_exe(exe);
     analyze_with(&root, exe.to_path_buf())
+}
+
+pub fn reanalyze(info: &GameInfo) -> Result<GameInfo, String> {
+    analyze_with(&info.root, info.exe.clone())
 }
 
 fn analyze_with(root: &Path, exe: PathBuf) -> Result<GameInfo, String> {
@@ -478,9 +503,9 @@ mod tests {
     fn name_scan_is_case_insensitive_and_utf16() {
         let mut data = b"...VERSION.DLL...".to_vec();
         data.extend(utf16("d3d12.dll"));
-        let r = referenced_names(&data, &ALL_PROXIES);
+        let r = referenced_names(&data, &TABLE_PROXIES);
         assert_eq!(r, vec!["version.dll".to_string(), "d3d12.dll".to_string()]);
-        assert!(!contains_ci(b"short", b"much longer needle"));
+        assert!(referenced_names(b"sh", &TABLE_PROXIES).is_empty());
     }
 
     #[test]
@@ -505,6 +530,10 @@ mod tests {
         assert!(!get("dinput8.dll").usable());
         assert_eq!(get("dxgi.dll").verdict(), "usable, render path");
         assert_eq!(get("d3d12.dll").load, Load::Never);
+        assert!(get("winmm.dll").fits_fg() && get("winmm.dll").fits_sm());
+        assert!(get("dxgi.dll").fits_fg() && !get("dxgi.dll").fits_sm());
+        assert!(!get("dsound.dll").fits_fg() && get("dsound.dll").fits_sm());
+        assert_eq!(slots.len(), TABLE_PROXIES.len());
         fs::remove_dir_all(&tmp).unwrap();
     }
 
